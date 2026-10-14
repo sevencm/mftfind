@@ -1,0 +1,193 @@
+name: Release
+
+# Pushing a tag is the only thing that publishes a release.
+# Tag rules are defined in RELEASING.md — the verify job enforces them.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release, e.g. v0.2.0-alpha.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      channel: ${{ steps.check.outputs.channel }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate against the version rules
+        id: check
+        shell: bash
+        env:
+          # Passed through the environment, never interpolated into the script,
+          # so a tag name containing shell metacharacters cannot inject code.
+          RAW_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="$RAW_TAG"
+
+          RULE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$'
+
+          if [[ ! "$TAG" =~ $RULE ]]; then
+            echo "::error::Tag '$TAG' violates the version rules."
+            echo "::error::Expected v<major>.<minor>.<patch>[-{alpha|beta|rc}.<ordinal>], e.g. v0.1.0 or v0.2.0-alpha.1"
+            echo "::error::See RELEASING.md for the full specification."
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+
+          CHANNEL="stable"
+          PRERELEASE="false"
+          if [[ "$VERSION" == *-* ]]; then
+            SUFFIX="${VERSION#*-}"
+            CHANNEL="${SUFFIX%.*}"
+            PRERELEASE="true"
+          fi
+
+          # Read package.version from Cargo.toml, [package] section only.
+          CARGO_VERSION="$(awk '
+            /^\[package\]/ { in_pkg = 1; next }
+            /^\[/          { in_pkg = 0 }
+            in_pkg && /^version[[:space:]]*=/ {
+              gsub(/[^0-9A-Za-z.+_-]/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+
+          if [[ "$CARGO_VERSION" != "$VERSION" ]]; then
+            echo "::error::Tag is '$TAG' but Cargo.toml declares version = \"$CARGO_VERSION\"."
+            echo "::error::Bump package.version to $VERSION and refresh Cargo.lock before tagging. See RELEASING.md."
+            exit 1
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release $TAG"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$VERSION\` |"
+            echo "| channel | \`$CHANNEL\` |"
+            echo "| pre-release | \`$PRERELEASE\` |"
+            echo "| Cargo.toml | \`$CARGO_VERSION\` (matches) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build and package
+    needs: verify
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          $name = "mftfind-v$env:VERSION-x86_64-pc-windows-msvc"
+
+          New-Item -ItemType Directory -Force -Path staging, dist | Out-Null
+          Copy-Item target/release/mftfind.exe staging/
+          Copy-Item mftfind.bat, README.md staging/
+          Compress-Archive -Path staging/* -DestinationPath "dist/$name.zip" -Force -CompressionLevel Optimal
+
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Encoding ascii "dist/SHA256SUMS.txt"
+
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table
+
+      - name: Upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          CHANNEL: ${{ needs.verify.outputs.channel }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+
+          TITLE="mftfind $TAG"
+          if [ "$CHANNEL" != "stable" ]; then
+            TITLE="$TITLE ($CHANNEL)"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — replacing its assets."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            ARGS=(--title "$TITLE" --generate-notes)
+            if [ "$PRERELEASE" = "true" ]; then
+              ARGS+=(--prerelease)
+            fi
+            gh release create "$TAG" "${ARGS[@]}" dist/*
+          fi
+
+          gh release view "$TAG" \
+            --json name,tagName,isPrerelease,url,assets \
+            --template '{{.name}} | prerelease={{.isPrerelease}}{{"\n"}}{{.url}}{{"\n"}}{{range .assets}}  - {{.name}} ({{.size}} bytes){{"\n"}}{{end}}'

@@ -161,6 +161,32 @@ Early but functional. Known open items:
 - Cold page cache queries are I/O-bound (~1.4 s for the first scan of 9.2 M
   records); subsequent queries hit ~150 ms.
 
+## Releases
+
+Versions follow [SemVer 2.0.0](https://semver.org/) and are published from
+annotated tags on the `vMAJOR.MINOR.PATCH[-CHANNEL.N]` form:
+
+```
+v0.1.0               stable
+v0.2.0-alpha.1       pre-release, feature set still moving
+v0.2.0-beta.1        pre-release, feature set frozen
+v0.2.0-rc.1          pre-release, blockers only
+```
+
+Pushing such a tag runs `.github/workflows/release.yml`, which validates the tag
+against `package.version` in `Cargo.toml`, builds on a Windows runner, and
+publishes a GitHub Release with a packaged zip and checksums attached.
+
+To cut one:
+
+```sh
+./scripts/release.sh 0.2.0-alpha.1 --push
+```
+
+The full rules — which component to bump, what counts as a breaking change
+(index format changes in particular), and how CI behaves — are in
+[RELEASING.md](RELEASING.md).
+
 ## License
 
 Not yet chosen.
