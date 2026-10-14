@@ -26,8 +26,8 @@ cd "$(dirname "$0")"
 if [ "${1:-}" = "--debug" ]; then
   shift
   "$CARGO" build "$@"
+  echo "构建完成: $(pwd)/target/debug/mftfind.exe（控制台子系统，便于看输出）"
 else
   "$CARGO" build --release "$@"
+  echo "构建完成: $(pwd)/target/release/mftfind.exe（windows 子系统，启动不弹控制台）"
 fi
-
-echo "构建完成: $(pwd)/target/release/mftfind.exe"

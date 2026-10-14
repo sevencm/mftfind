@@ -9,6 +9,17 @@
 //!   mftfind bench [C ...]        索引 + 搜索性能基准
 //!   mftfind drives               列出磁盘、权限与索引状态
 //!   mftfind mft [C ...]          直接探测 MFT 枚举（不走向遍历回退），用于定位问题
+//!
+//! 关于控制台：
+//! 默认（不写 `windows_subsystem`）会链接成 `IMAGE_SUBSYSTEM_WINDOWS_CUI`，
+//! 也就是「控制台程序」——只要启动就一定有一个黑窗口，从资源管理器双击更是如此。
+//! 这里指定 `windows` 子系统，双击启动就不会再弹控制台；
+//! 代价是进程拿不到标准句柄，需要在 main() 里用 `win::init_console` 修回来，
+//! 否则 CLI 子命令和任何 println! 都会失效。
+//! 用 `not(debug_assertions)` 限定，是为了让 debug 构建仍是控制台程序，
+//! 方便 `cargo run -- bench` 这类调试时直接看输出。
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod build;
 mod format;
@@ -363,7 +374,17 @@ fn cmd_drives() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(|s| s.as_str()) {
+    let first = args.first().map(|s| s.as_str());
+
+    // 启动第一件事就修标准流：必须在任何 println! 之前，
+    // 因为标准库会在首次使用时把句柄缓存起来，之后再 SetStdHandle 就晚了。
+    // 只有 gui / 无参数（图形界面）走 Gui 模式，其余子命令都允许接回终端。
+    win::init_console(match first {
+        Some("gui") | None => win::ConsoleMode::Gui,
+        _ => win::ConsoleMode::Cli,
+    });
+
+    match first {
         Some("index") => cmd_index(&args[1..]),
         Some("search") => cmd_search(&args[1..]),
         Some("bench") => cmd_bench(&args[1..]),

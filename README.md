@@ -70,6 +70,29 @@ The `mft` subcommand is the diagnostic entry point: it prints raw Win32 error co
 so a failed index can be traced to permissions, volume features, or enumeration logic
 in one shot.
 
+### Console behavior
+
+Release builds link as `IMAGE_SUBSYSTEM_WINDOWS`
+(`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` in
+`src/main.rs`), so double-clicking the executable does **not** open a console
+window. Without that attribute the binary defaults to the console subsystem and
+Windows allocates a console on every launch, including from Explorer.
+
+That subsystem has a consequence: the process is created *without* standard
+handles, so `println!` would fail and panic. `win::init_console` repairs the
+three stream slots before the first print:
+
+- already-valid handles are left untouched, so `mftfind search x > out.txt` and
+  pipes keep working;
+- for CLI subcommands with an invalid stdout, it attaches to the parent console
+  and reopens `CONOUT$`, so output still reaches the terminal that started it;
+- for the GUI, or when there is no console at all, the streams are pointed at
+  `NUL` — output is discarded rather than crashing the process.
+
+Two details worth knowing: a GUI-subsystem app launched from a command prompt
+prints *after* the next prompt, because the shell does not wait for it; and debug
+builds keep the console subsystem, so `cargo run -- bench` behaves normally.
+
 ### GUI
 
 - Incremental search — results narrow as you type

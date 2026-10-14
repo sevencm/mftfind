@@ -19,6 +19,17 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
+// 标准流句柄槽位（Win32 里是负数的 DWORD）
+const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+
+const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+const INVALID_HANDLE_VALUE: isize = -1;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const OPEN_EXISTING: u32 = 3;
+
 #[link(name = "kernel32")]
 extern "system" {
     fn DeviceIoControl(
@@ -44,6 +55,19 @@ extern "system" {
         fs_name: *mut u16,
         fs_name_size: u32,
     ) -> i32;
+
+    fn GetStdHandle(std_handle: u32) -> isize;
+    fn SetStdHandle(std_handle: u32, handle: isize) -> i32;
+    fn AttachConsole(process_id: u32) -> i32;
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *mut u8,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: isize,
+    ) -> isize;
 }
 
 #[link(name = "shell32")]
@@ -56,6 +80,71 @@ extern "system" {
         directory: *const u16,
         show_cmd: i32,
     ) -> isize;
+}
+
+/// 启动时的标准流处理方式。
+pub enum ConsoleMode {
+    /// CLI 子命令：允许接回调用者的控制台，好让 `mftfind search` 照常往终端打印。
+    Cli,
+    /// 图形界面：绝不接控制台。接了的话，用户一关终端就会连同界面一起被带走。
+    /// 这里只保证标准句柄不会「无效到让 println! panic」。
+    Gui,
+}
+
+/// 修正标准流句柄。
+///
+/// 背景：release 版本以 `IMAGE_SUBSYSTEM_WINDOWS` 链接（见 main.rs 顶部的
+/// `windows_subsystem`），好处是从资源管理器双击不再弹出控制台窗口，
+/// 代价是进程被创建时**不再自动获得标准句柄**——此时
+/// `GetStdHandle` 返回空，任何 `println!` / `eprintln!` 都会写失败并 panic。
+///
+/// 所以这里逐一检查三个槽位：
+///   * 句柄已经有效 → 原样保留。重定向（`> out.txt`）、管道、IDE 传入的句柄
+///     都属于这一类，替换掉就会破坏这些用法。
+///   * 句柄无效 → CLI 模式下尝试接回父控制台并用 `CONOUT$` / `CONIN$`，
+///     接不上（双击启动、父进程没有控制台）以及 GUI 模式一律指向 `NUL`，
+///     让输出被安静丢弃而不是让程序崩溃。
+pub fn init_console(mode: ConsoleMode) {
+    let attached = match mode {
+        // 没有父控制台时返回 0，且**不会新建窗口**，所以双击启动也不会闪一下。
+        ConsoleMode::Cli => unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 },
+        ConsoleMode::Gui => false,
+    };
+
+    for (slot, console_device) in [
+        (STD_INPUT_HANDLE, "CONIN$"),
+        (STD_OUTPUT_HANDLE, "CONOUT$"),
+        (STD_ERROR_HANDLE, "CONOUT$"),
+    ] {
+        if handle_valid(slot) {
+            continue;
+        }
+        let device = if attached { console_device } else { "NUL" };
+        let access = if slot == STD_INPUT_HANDLE {
+            GENERIC_READ
+        } else {
+            GENERIC_WRITE
+        };
+        let handle = unsafe {
+            CreateFileW(
+                wide(device).as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && handle != 0 {
+            unsafe { SetStdHandle(slot, handle) };
+        }
+    }
+}
+
+fn handle_valid(slot: u32) -> bool {
+    let h = unsafe { GetStdHandle(slot) };
+    h != 0 && h != INVALID_HANDLE_VALUE
 }
 
 /// 用系统默认程序打开文件；目录则打开资源管理器
