@@ -106,8 +106,9 @@ builds keep the console subsystem, so `cargo run -- bench` behaves normally.
 The interface ships in Chinese and English. At startup the language comes from
 `%APPDATA%\mftfind\ui.ini`, falling back to the system UI language queried via
 `GetUserDefaultUILanguage` — Chinese systems get Chinese, everything else gets
-English. The selector in the top bar switches immediately and remembers the
-choice.
+English. The **Language menu** in the menu bar switches immediately and
+remembers the choice; entries are written in their own language (中文 / English)
+so they can be found even when the current UI language is unreadable to you.
 
 Every string lives in `src/i18n.rs` as two `Strings` tables and the UI code
 contains no literal labels at all. Adding a language means adding a `Lang`

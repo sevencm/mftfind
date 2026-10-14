@@ -21,9 +21,9 @@ use crate::win;
 const MAX_HITS: usize = 20_000;
 const ROW_HEIGHT: f32 = 20.0;
 
-/// 搜索框右侧控件（路径勾选框 + 排序下拉 + 语言标签与下拉）预留的宽度。
-/// 两种语言的按钮宽度不同，这里给一个够用的固定值，避免切语言时搜索框跳动。
-const CONTROLS_WIDTH: f32 = 430.0;
+/// 搜索框右侧控件（路径勾选框 + 排序下拉）预留的宽度。
+/// 固定值避免切语言时搜索框跳动；语言选择在菜单栏，不占这行宽度。
+const CONTROLS_WIDTH: f32 = 230.0;
 
 struct Meta {
     ms: f64,
@@ -416,12 +416,31 @@ impl eframe::App for App {
             self.focus_search = true;
         }
 
+        // ---------- 菜单栏 ----------
+        egui::Panel::top("menu").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                let before = self.lang;
+                ui.menu_button(s.language, |ui| {
+                    for lang in Lang::ALL {
+                        // 当前语言打勾；选项文字用各自语言书写，看不懂当前界面语言
+                        // 的人也能在菜单里认出自己的那一项
+                        let mark = if lang == self.lang { "✓ " } else { "   " };
+                        ui.selectable_value(&mut self.lang, lang, format!("{mark}{}", lang.endonym()));
+                    }
+                });
+                if self.lang != before {
+                    i18n::save(self.lang);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(self.lang)));
+                }
+            });
+        });
+
         // ---------- 顶部搜索栏 ----------
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(s.search_label);
-                // 给「路径」勾选框 + 排序下拉 + 语言下拉留出固定宽度
+                // 给「路径」勾选框 + 排序下拉留出固定宽度
                 let desired = ui.available_width() - CONTROLS_WIDTH;
                 let resp = ui.add_sized(
                     [desired.max(200.0), 24.0],
@@ -445,22 +464,6 @@ impl eframe::App for App {
                         ui.selectable_value(&mut self.sort, SortBy::Size, s.sort_size);
                         ui.selectable_value(&mut self.sort, SortBy::Kind, s.sort_kind);
                     });
-                // 语言选择器放在本行最右端。
-                // 刻意不放进第二行用 right_to_left 布局靠右——那样会吞掉该行剩余宽度，
-                // 把后面的索引进度文字挤到看不见。
-                let before = self.lang;
-                ui.label(s.language);
-                egui::ComboBox::from_id_salt("lang")
-                    .selected_text(before.endonym())
-                    .show_ui(ui, |ui| {
-                        for lang in Lang::ALL {
-                            ui.selectable_value(&mut self.lang, lang, lang.endonym());
-                        }
-                    });
-                if self.lang != before {
-                    i18n::save(self.lang);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(self.lang)));
-                }
             });
             ui.horizontal(|ui| {
                 if ui.button(s.choose_scope).clicked() {
