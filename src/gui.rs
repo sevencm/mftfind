@@ -21,6 +21,15 @@ use crate::win;
 const MAX_HITS: usize = 20_000;
 const ROW_HEIGHT: f32 = 20.0;
 
+/// 菜单里标记当前项用的勾，以及不选中时占位的等宽空白。
+///
+/// 这个勾**依赖 `install_fonts` 里的符号字体回退**：egui 0.36 自带的三个字体
+/// 都不含 `✓`（实测只覆盖 `☐ ● • · √ ★ ☆ → ⛃ ☜`），少了 Segoe UI Symbol
+/// 就会显示成豆腐块空框。有单测锁住
+/// （`menu_check_mark_is_actually_renderable`）。
+const CHECK_MARK: &str = "✓ ";
+const NO_MARK: &str = "   ";
+
 /// 搜索框右侧控件（路径勾选框 + 排序下拉）预留的宽度。
 /// 固定值避免切语言时搜索框跳动；语言选择在菜单栏，不占这行宽度。
 const CONTROLS_WIDTH: f32 = 230.0;
@@ -144,7 +153,7 @@ pub struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, lang: Lang) -> App {
-        install_cjk_font(&cc.egui_ctx);
+        install_fonts(&cc.egui_ctx);
         let indexes = Arc::new(load_indexes());
         let total_records = indexes.iter().map(|i| i.count as usize).sum();
         let elevated = win::is_elevated();
@@ -323,36 +332,53 @@ fn list_drive_items() -> Vec<DriveItem> {
         .collect()
 }
 
-/// 加载中文字体（egui 自带字体不含 CJK）。
+/// 装配界面字体：egui 自带字体 + 系统符号/CJK 字体。
 ///
-/// 注意是 **push 到末尾** 而不是插到开头：egui 按家族列表顺序逐字查找字形，
-/// 放在末尾意味着拉丁字母仍用 egui 自带字体渲染（更好看），只有缺字时才回退到中文字体。
-/// 放到开头会让英文界面里所有字母都用黑体渲染。
-fn install_cjk_font(ctx: &egui::Context) {
-    let candidates = [
-        "C:/Windows/Fonts/simhei.ttf",
-        "C:/Windows/Fonts/Deng.ttf",
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simsun.ttc",
-    ];
+/// 回退顺序（egui 按家族列表逐字查找字形，取第一个命中的）：
+///   Ubuntu-Light → NotoEmoji → emoji-icon-font → Segoe UI Symbol → 中文字体
+///
+/// - 拉丁字母走 egui 自带字体（比黑体好看），中文只在缺字时才回退，
+///   所以 CJK 字体是 **push 到末尾** 而不是插到开头。插到开头会让英文界面
+///   里所有字母都用黑体渲染。
+/// - 符号字体（Segoe UI Symbol）是必需的：egui 0.36 自带的三个字体
+///   **不含** `✔ ✓ ☑ ☀` 这类符号（实测覆盖范围里只有 `☐ ● • · √ ★ ☆ → ⛃ ☜`），
+///   菜单里的勾会直接变成豆腐块空框。有单测锁住这一点
+///   （`menu_check_mark_is_actually_renderable`）。
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    // 顺序即优先级：符号字体排在中文字体之前，各取所长
+    add_fallback(
+        &mut fonts,
+        "symbol",
+        &["C:/Windows/Fonts/seguisym.ttf", "C:/Windows/Fonts/segoeui.ttf"],
+    );
+    add_fallback(
+        &mut fonts,
+        "cjk",
+        &[
+            "C:/Windows/Fonts/simhei.ttf",
+            "C:/Windows/Fonts/Deng.ttf",
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simsun.ttc",
+        ],
+    );
+    ctx.set_fonts(fonts);
+}
+
+/// 从候选路径里取第一个能读到的字体，追加到两个家族的回退链末尾。
+fn add_fallback(fonts: &mut egui::FontDefinitions, name: &str, candidates: &[&str]) {
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "cjk".to_owned(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
             fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("cjk".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("cjk".to_owned());
-            ctx.set_fonts(fonts);
+                .font_data
+                .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push(name.to_owned());
+            }
             return;
         }
     }
@@ -424,8 +450,12 @@ impl eframe::App for App {
                     for lang in Lang::ALL {
                         // 当前语言打勾；选项文字用各自语言书写，看不懂当前界面语言
                         // 的人也能在菜单里认出自己的那一项
-                        let mark = if lang == self.lang { "✓ " } else { "   " };
-                        ui.selectable_value(&mut self.lang, lang, format!("{mark}{}", lang.endonym()));
+                        let mark = if lang == self.lang { CHECK_MARK } else { NO_MARK };
+                        ui.selectable_value(
+                            &mut self.lang,
+                            lang,
+                            format!("{mark}{}", lang.endonym()),
+                        );
                     }
                 });
                 if self.lang != before {
@@ -725,4 +755,42 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, lang)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 用界面同一套字体栈渲染一帧，报告某个字符有没有字形。
+    fn renders(text: &str) -> bool {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let font = egui::FontId::proportional(14.0);
+        let mut ok = false;
+        // eframe 0.36 里 egui 的入口是 run_ui（接收 &mut Ui），不再是 run
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            ok = ui.ctx().fonts_mut(|f| f.has_glyphs(&font, text));
+        });
+        // epaint 要求渲染产生的纹理增量被处理掉，否则析构时会 panic
+        out.textures_delta.clear();
+        ok
+    }
+
+    /// 菜单里的勾必须真能渲染出来。
+    ///
+    /// 这里踩过一次坑：egui 0.36 自带的三个字体（Ubuntu-Light / NotoEmoji /
+    /// emoji-icon-font）**都不含** `✓`，界面上显示成豆腐块空框——用户就是这么
+    /// 发现的。实测它们的符号覆盖只有 `☐ ● • · √ ★ ☆ → ⛃ ☜`，
+    /// `✓ ✔ ☑ ☀` 全缺；补上 Segoe UI Symbol 之后 `✓` 才有。
+    /// 所以这个测试同时锁住两件事：勾的字形、以及提供它的那个回退字体。
+    #[test]
+    fn menu_check_mark_is_actually_renderable() {
+        assert!(
+            renders(CHECK_MARK.trim()),
+            "字体栈里没有 {:?} 的字形，菜单会显示成豆腐块——检查 install_fonts 里的符号字体回退",
+            CHECK_MARK.trim()
+        );
+        // 顺带确认 CJK 字体那一路回退也还在（中文界面全靠它）
+        assert!(renders("中"), "CJK 字体回退失效，中文会显示成豆腐块");
+    }
 }
