@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::format::write_index;
+use crate::i18n::Lang;
 use crate::{mft, walk};
 
 /// 索引目录：按 exe 的实际位置解析，而不是烧死编译期路径。
@@ -49,8 +50,30 @@ pub struct BuildOutcome {
     pub total_secs: f64,
     pub used_mft: bool,
     /// MFT 不可用而回退到并行遍历时的原因（供状态栏显示）
-    pub fallback_reason: Option<String>,
+    pub fallback_reason: Option<FallbackReason>,
     pub bytes: u64,
+}
+
+/// 回退到并行遍历的原因。
+///
+/// 刻意存枚举而不是现成的字符串：文案要在界面里按当前语言渲染，
+/// 否则切到英文界面时会冒出中文的「MFT 未返回记录」。
+#[derive(Clone, Debug)]
+pub enum FallbackReason {
+    /// MFT 枚举成功，但一条记录都没返回
+    NoRecords,
+    /// 底层调用失败（未提权时通常是拒绝访问）
+    Error(String),
+}
+
+impl FallbackReason {
+    pub fn text(&self, lang: Lang) -> String {
+        match self {
+            FallbackReason::NoRecords => lang.strings().fallback_no_records.to_string(),
+            // 系统错误信息由 Windows 自行本地化，原样透出
+            FallbackReason::Error(e) => e.clone(),
+        }
+    }
 }
 
 /// 建立某个卷的索引并落盘
@@ -72,13 +95,13 @@ pub fn build_volume(
             }
             Ok(_) => {
                 // 枚举到 0 条说明 MFT 这条路没拿到东西，别写一个空索引覆盖掉可用数据
-                fallback_reason = Some("MFT 未返回记录".to_string());
+                fallback_reason = Some(FallbackReason::NoRecords);
                 walk::walk_volume(letter, progress)
             }
             Err(e) => {
                 // 未提权时访问被拒是预期情况；其他 MFT 失败（如驱动/卷特性差异）
                 // 也不该让整块盘索引失败——统一回退并行遍历，并记录原因供界面提示。
-                fallback_reason = Some(e.to_string());
+                fallback_reason = Some(FallbackReason::Error(e.to_string()));
                 walk::walk_volume(letter, progress)
             }
         }

@@ -59,6 +59,7 @@ extern "system" {
     fn GetStdHandle(std_handle: u32) -> isize;
     fn SetStdHandle(std_handle: u32, handle: isize) -> i32;
     fn AttachConsole(process_id: u32) -> i32;
+    fn GetUserDefaultUILanguage() -> u16;
     fn CreateFileW(
         file_name: *const u16,
         desired_access: u32,
@@ -145,6 +146,17 @@ pub fn init_console(mode: ConsoleMode) {
 fn handle_valid(slot: u32) -> bool {
     let h = unsafe { GetStdHandle(slot) };
     h != 0 && h != INVALID_HANDLE_VALUE
+}
+
+/// 系统 UI 语言（LANGID）。低 10 位是主语言 ID，中文为 0x04。
+/// 用它而非环境变量（LANG / LC_ALL）判断，因为 Windows 上后者经常为空或不准。
+pub fn ui_language() -> Option<u16> {
+    let id = unsafe { GetUserDefaultUILanguage() };
+    if id == 0 {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 /// 用系统默认程序打开文件；目录则打开资源管理器

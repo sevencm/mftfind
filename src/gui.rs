@@ -13,6 +13,7 @@ use eframe::egui;
 
 use crate::build;
 use crate::format::Index;
+use crate::i18n::{self, Lang};
 use crate::search::{parse_query, search, search_paths, sort_hits_multi, Hit, SortBy};
 use crate::win;
 
@@ -20,11 +21,94 @@ use crate::win;
 const MAX_HITS: usize = 20_000;
 const ROW_HEIGHT: f32 = 20.0;
 
+/// 搜索框右侧控件（路径勾选框 + 排序下拉 + 语言标签与下拉）预留的宽度。
+/// 两种语言的按钮宽度不同，这里给一个够用的固定值，避免切语言时搜索框跳动。
+const CONTROLS_WIDTH: f32 = 430.0;
+
 struct Meta {
     ms: f64,
     total: usize,
     generation: u64,
     path_ready_ms: f64,
+}
+
+/// 状态栏消息。**存结构化数据而不是渲染好的字符串**——
+/// 字符串在生成那一刻就固定了语言，切换语言后旧文案不会跟着变
+/// （首次切语言的 bug 根因）。绘制时才用当前语言渲染。
+enum Status {
+    Elevated,
+    NotElevated,
+    Reloaded,
+    Copied,
+    OpenFailed(String),
+    RevealFailed(String),
+}
+
+impl Status {
+    fn text(&self, s: &i18n::Strings) -> String {
+        match self {
+            Status::Elevated => s.status_elevated.to_string(),
+            Status::NotElevated => s.status_not_elevated.to_string(),
+            Status::Reloaded => s.status_reloaded.to_string(),
+            Status::Copied => s.status_copied.to_string(),
+            Status::OpenFailed(e) => s.open_failed(e),
+            Status::RevealFailed(e) => s.reveal_failed(e),
+        }
+    }
+}
+
+/// 单卷索引结果（供状态栏按当前语言渲染）
+struct VolumeDone {
+    letter: char,
+    count: usize,
+    scan_secs: f64,
+    total_secs: f64,
+    used_mft: bool,
+    fallback: Option<build::FallbackReason>,
+    /// 全部卷索引结束后置 true，状态栏追加「可开始搜索」
+    ready: bool,
+}
+
+/// 索引进度。跨线程共享（后台线程写、界面线程读），同样存结构化数据。
+enum IndexStatus {
+    None,
+    Start(char),
+    Progress(char, usize),
+    Done(VolumeDone),
+    Failed { letter: char, error: String },
+}
+
+impl IndexStatus {
+    fn text(&self, s: &i18n::Strings, lang: Lang) -> Option<String> {
+        let body = match self {
+            IndexStatus::None => return None,
+            IndexStatus::Start(letter) => s.indexing_start(*letter),
+            IndexStatus::Progress(letter, n) => s.indexing_progress(*letter, *n),
+            IndexStatus::Done(d) => {
+                let fallback = d
+                    .fallback
+                    .as_ref()
+                    .map(|r| s.mft_fallback(&r.text(lang)))
+                    .unwrap_or_default();
+                let method = if d.used_mft { s.method_mft } else { s.method_walk };
+                s.indexing_done(
+                    d.letter,
+                    d.count,
+                    d.scan_secs,
+                    d.total_secs,
+                    method,
+                    &fallback,
+                )
+            }
+            IndexStatus::Failed { letter, error } => s.indexing_failed(*letter, error),
+        };
+        let ready = matches!(self, IndexStatus::Done(d) if d.ready);
+        Some(if ready {
+            format!("{}{}", body, s.ready_to_search)
+        } else {
+            body
+        })
+    }
 }
 
 struct DriveItem {
@@ -46,18 +130,20 @@ pub struct App {
     generation: u64,
     size_cache: HashMap<(usize, u32), String>,
     selected: Option<usize>,
-    status: String,
-    index_status: Arc<Mutex<String>>,
+    status: Status,
+    index_status: Arc<Mutex<IndexStatus>>,
     indexing: bool,
     drives: Vec<DriveItem>,
     show_scope: bool,
     elevated: bool,
     total_records: usize,
     focus_search: bool,
+    /// 当前界面语言。改动后立即生效并写入配置文件。
+    lang: Lang,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> App {
+    fn new(cc: &eframe::CreationContext<'_>, lang: Lang) -> App {
         install_cjk_font(&cc.egui_ctx);
         let indexes = Arc::new(load_indexes());
         let total_records = indexes.iter().map(|i| i.count as usize).sum();
@@ -79,17 +165,18 @@ impl App {
             size_cache: HashMap::new(),
             selected: None,
             status: if elevated {
-                "已以管理员运行，索引将走 MFT 快路径".to_string()
+                Status::Elevated
             } else {
-                "当前非管理员：MFT 不可用会回退并行遍历（点右上角按钮可提权重启）".to_string()
+                Status::NotElevated
             },
-            index_status: Arc::new(Mutex::new(String::new())),
+            index_status: Arc::new(Mutex::new(IndexStatus::None)),
             indexing: false,
             drives: list_drive_items(),
             show_scope: false,
             elevated,
             total_records,
             focus_search: true,
+            lang,
         };
         app.spawn_search(&cc.egui_ctx);
         app
@@ -163,37 +250,39 @@ impl App {
         let elevated = self.elevated;
         std::thread::spawn(move || {
             for letter in letters {
-                *status.lock().unwrap() = format!("正在索引 {}: …", letter);
+                *status.lock().unwrap() = IndexStatus::Start(letter);
                 let mut last = 0usize;
                 let res = build::build_volume(letter, force_walk && !elevated, &mut |n| {
                     if n - last >= 100_000 {
                         last = n;
-                        *status.lock().unwrap() =
-                            format!("正在索引 {}: 已 {} 条…", letter, n);
+                        *status.lock().unwrap() = IndexStatus::Progress(letter, n);
                     }
                 });
                 match res {
                     Ok(o) => {
-                        *status.lock().unwrap() = format!(
-                            "{}: 完成 {} 条，扫描 {:.1}s，总计 {:.1}s（{}{}）",
+                        *status.lock().unwrap() = IndexStatus::Done(VolumeDone {
                             letter,
-                            o.count,
-                            o.scan_secs,
-                            o.total_secs,
-                            if o.used_mft { "MFT" } else { "并行遍历" },
-                            match &o.fallback_reason {
-                                Some(r) => format!("，MFT 回退原因：{}", r),
-                                None => String::new(),
-                            }
-                        );
+                            count: o.count,
+                            scan_secs: o.scan_secs,
+                            total_secs: o.total_secs,
+                            used_mft: o.used_mft,
+                            fallback: o.fallback_reason,
+                            ready: false,
+                        });
                     }
                     Err(e) => {
-                        *status.lock().unwrap() = format!("{}: 索引失败 - {}", letter, e);
+                        *status.lock().unwrap() = IndexStatus::Failed {
+                            letter,
+                            error: e.to_string(),
+                        };
                     }
                 }
                 ctx.request_repaint();
             }
-            *status.lock().unwrap() = format!("{}（可开始搜索）", status.lock().unwrap());
+            // 全部卷结束，在最终状态上标记「可开始搜索」
+            if let IndexStatus::Done(d) = &mut *status.lock().unwrap() {
+                d.ready = true;
+            }
             ctx.request_repaint();
         });
     }
@@ -234,7 +323,11 @@ fn list_drive_items() -> Vec<DriveItem> {
         .collect()
 }
 
-/// 加载中文字体（egui 自带字体不含 CJK）
+/// 加载中文字体（egui 自带字体不含 CJK）。
+///
+/// 注意是 **push 到末尾** 而不是插到开头：egui 按家族列表顺序逐字查找字形，
+/// 放在末尾意味着拉丁字母仍用 egui 自带字体渲染（更好看），只有缺字时才回退到中文字体。
+/// 放到开头会让英文界面里所有字母都用黑体渲染。
 fn install_cjk_font(ctx: &egui::Context) {
     let candidates = [
         "C:/Windows/Fonts/simhei.ttf",
@@ -253,7 +346,7 @@ fn install_cjk_font(ctx: &egui::Context) {
                 .families
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
-                .insert(0, "cjk".to_owned());
+                .push("cjk".to_owned());
             fonts
                 .families
                 .entry(egui::FontFamily::Monospace)
@@ -312,6 +405,8 @@ impl eframe::App for App {
     // 由框架提供一个根 Ui，面板挂在它上面（Panel/CentralPanel::show 现在接收 &mut Ui）。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 本帧用到的文案表。切换语言后当前帧仍用旧表，下一帧生效。
+        let s = self.lang.strings();
 
         // ---------- 快捷键 ----------
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -325,47 +420,67 @@ impl eframe::App for App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("搜索");
-                let desired = ui.available_width()
-                    - if self.elevated { 300.0 } else { 300.0 };
+                ui.label(s.search_label);
+                // 给「路径」勾选框 + 排序下拉 + 语言下拉留出固定宽度
+                let desired = ui.available_width() - CONTROLS_WIDTH;
                 let resp = ui.add_sized(
                     [desired.max(200.0), 24.0],
-                    egui::TextEdit::singleline(&mut self.query).hint_text("文件名关键词，多关键词空格分隔（含 \\ 则匹配完整路径）"),
+                    egui::TextEdit::singleline(&mut self.query).hint_text(s.search_hint),
                 );
                 if self.focus_search {
                     resp.request_focus();
                     self.focus_search = false;
                 }
-                ui.checkbox(&mut self.path_mode, "路径");
+                ui.checkbox(&mut self.path_mode, s.path_mode);
                 egui::ComboBox::from_id_salt("sort")
                     .selected_text(match self.sort {
-                        SortBy::Name => "名称",
-                        SortBy::Modified => "时间",
-                        SortBy::Size => "大小",
-                        SortBy::Kind => "类型",
+                        SortBy::Name => s.sort_name,
+                        SortBy::Modified => s.sort_modified,
+                        SortBy::Size => s.sort_size,
+                        SortBy::Kind => s.sort_kind,
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sort, SortBy::Name, "名称");
-                        ui.selectable_value(&mut self.sort, SortBy::Modified, "时间");
-                        ui.selectable_value(&mut self.sort, SortBy::Size, "大小");
-                        ui.selectable_value(&mut self.sort, SortBy::Kind, "类型");
+                        ui.selectable_value(&mut self.sort, SortBy::Name, s.sort_name);
+                        ui.selectable_value(&mut self.sort, SortBy::Modified, s.sort_modified);
+                        ui.selectable_value(&mut self.sort, SortBy::Size, s.sort_size);
+                        ui.selectable_value(&mut self.sort, SortBy::Kind, s.sort_kind);
                     });
+                // 语言选择器放在本行最右端。
+                // 刻意不放进第二行用 right_to_left 布局靠右——那样会吞掉该行剩余宽度，
+                // 把后面的索引进度文字挤到看不见。
+                let before = self.lang;
+                ui.label(s.language);
+                egui::ComboBox::from_id_salt("lang")
+                    .selected_text(before.endonym())
+                    .show_ui(ui, |ui| {
+                        for lang in Lang::ALL {
+                            ui.selectable_value(&mut self.lang, lang, lang.endonym());
+                        }
+                    });
+                if self.lang != before {
+                    i18n::save(self.lang);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(self.lang)));
+                }
             });
             ui.horizontal(|ui| {
-                if ui.button("选择索引范围 / 重建").clicked() {
+                if ui.button(s.choose_scope).clicked() {
                     self.drives = list_drive_items();
                     self.show_scope = true;
                 }
-                if ui.button("重新加载索引").clicked() {
+                if ui.button(s.reload_indexes).clicked() {
                     self.reload_indexes();
-                    self.status = "已重新加载索引文件".to_string();
+                    self.status = Status::Reloaded;
                 }
-                if !self.elevated && ui.button("以管理员身份重启").clicked() {
+                if !self.elevated && ui.button(s.restart_admin).clicked() {
                     let _ = win::restart_as_admin("");
                 }
-                let s = self.index_status.lock().unwrap().clone();
-                if !s.is_empty() {
-                    ui.label(egui::RichText::new(s).color(egui::Color32::from_rgb(200, 150, 60)));
+                // 按当前语言渲染；后台线程随时可能改写，绘制完立刻释放锁
+                let st = {
+                    let st = self.index_status.lock().unwrap();
+                    st.text(s, self.lang)
+                };
+                if let Some(text) = st {
+                    ui.label(egui::RichText::new(text).color(egui::Color32::from_rgb(200, 150, 60)));
                 }
                 if self.indexing {
                     ui.spinner();
@@ -378,20 +493,16 @@ impl eframe::App for App {
         egui::Panel::bottom("bottom").show(ui, |ui| {
             let meta = self.meta.lock().unwrap();
             ui.horizontal(|ui| {
-                ui.label(format!(
-                    "索引 {} 个卷 / {} 条",
-                    self.indexes.len(),
-                    self.total_records
-                ));
+                ui.label(s.volumes_and_records(self.indexes.len(), self.total_records));
                 ui.separator();
                 if meta.total > 0 {
-                    ui.label(format!("命中 {} 条", meta.total));
-                    ui.label(format!("搜索 {:.1} ms", meta.ms));
+                    ui.label(s.hit_count(meta.total));
+                    ui.label(s.search_ms(meta.ms));
                 } else {
-                    ui.label("输入关键词开始搜索");
+                    ui.label(s.type_to_search);
                 }
                 ui.separator();
-                ui.label(&self.status);
+                ui.label(self.status.text(s));
             });
         });
 
@@ -400,12 +511,12 @@ impl eframe::App for App {
             let mut open = self.show_scope;
             let mut start = false;
             let mut force_walk = false;
-            egui::Window::new("选择索引范围")
+            egui::Window::new(s.scope_title)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .show(&ctx, |ui| {
-                    ui.label("勾选需要索引的磁盘（管理员权限下走 MFT，约 1~3 秒/百万文件）：");
+                    ui.label(s.scope_hint);
                     for d in self.drives.iter_mut() {
                         ui.horizontal(|ui| {
                             ui.checkbox(
@@ -415,23 +526,23 @@ impl eframe::App for App {
                                     d.letter,
                                     d.label,
                                     d.fs,
-                                    if d.indexed { "（已有索引）" } else { "" }
+                                    if d.indexed { s.already_indexed } else { "" }
                                 ),
                             );
                         });
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("开始索引").clicked() {
+                        if ui.button(s.start_indexing).clicked() {
                             start = true;
                         }
-                        ui.checkbox(&mut force_walk, "强制用遍历（不提权）");
+                        ui.checkbox(&mut force_walk, s.force_walk);
                     });
                     ui.label(
                         egui::RichText::new(if self.elevated {
-                            "当前已是管理员：将优先使用 MFT 快路径"
+                            s.scope_elevated
                         } else {
-                            "当前非管理员：MFT 会被拒绝，自动回退并行遍历"
+                            s.scope_not_elevated
                         })
                         .small(),
                     );
@@ -465,10 +576,10 @@ impl eframe::App for App {
             let w_path = (avail - w_name - w_size - w_time - 24.0).max(120.0);
 
             ui.horizontal(|ui| {
-                ui.add_sized([w_name, row_h], egui::Label::new(egui::RichText::new("名称").strong()));
-                ui.add_sized([w_path, row_h], egui::Label::new(egui::RichText::new("路径").strong()));
-                ui.add_sized([w_size, row_h], egui::Label::new(egui::RichText::new("大小").strong()));
-                ui.add_sized([w_time, row_h], egui::Label::new(egui::RichText::new("修改时间").strong()));
+                ui.add_sized([w_name, row_h], egui::Label::new(egui::RichText::new(s.col_name).strong()));
+                ui.add_sized([w_path, row_h], egui::Label::new(egui::RichText::new(s.col_path).strong()));
+                ui.add_sized([w_size, row_h], egui::Label::new(egui::RichText::new(s.col_size).strong()));
+                ui.add_sized([w_time, row_h], egui::Label::new(egui::RichText::new(s.col_modified).strong()));
             });
             ui.separator();
 
@@ -548,13 +659,13 @@ impl eframe::App for App {
                             open_path = Some((full.clone(), is_dir));
                         }
                         resp.context_menu(|ui| {
-                            if ui.button("打开").clicked() {
+                            if ui.button(s.menu_open).clicked() {
                                 open_path = Some((full.clone(), is_dir));
                             }
-                            if ui.button("打开所在文件夹").clicked() {
+                            if ui.button(s.menu_reveal).clicked() {
                                 reveal = Some(full.clone());
                             }
-                            if ui.button("复制完整路径").clicked() {
+                            if ui.button(s.menu_copy).clicked() {
                                 copy = Some(full.clone());
                             }
                         });
@@ -563,17 +674,17 @@ impl eframe::App for App {
 
             if let Some((p, d)) = open_path {
                 if let Err(e) = win::open_path(&p, d) {
-                    self.status = format!("打开失败：{}", e);
+                    self.status = Status::OpenFailed(e.to_string());
                 }
             }
             if let Some(p) = reveal {
                 if let Err(e) = win::reveal_in_explorer(&p) {
-                    self.status = format!("打开目录失败：{}", e);
+                    self.status = Status::RevealFailed(e.to_string());
                 }
             }
             if let Some(p) = copy {
                 ctx.copy_text(p);
-                self.status = "路径已复制到剪贴板".to_string();
+                self.status = Status::Copied;
             }
         });
     }
@@ -587,17 +698,28 @@ fn parent_of(path: &str) -> String {
     }
 }
 
+/// 窗口标题，随语言变化
+fn window_title(lang: Lang) -> String {
+    format!(
+        "mftfind {} - {}",
+        env!("CARGO_PKG_VERSION"),
+        lang.strings().window_title
+    )
+}
+
 pub fn run() -> eframe::Result<()> {
+    // 语言在这里定一次：读取记住的选择，没有则按系统 UI 语言判断
+    let lang = i18n::load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 700.0])
             .with_min_inner_size([720.0, 420.0])
-            .with_title("mftfind - 极速文件搜索"),
+            .with_title(window_title(lang)),
         ..Default::default()
     };
     eframe::run_native(
         "mftfind",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, lang)))),
     )
 }

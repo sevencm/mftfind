@@ -24,6 +24,7 @@
 mod build;
 mod format;
 mod gui;
+mod i18n;
 mod mft;
 mod search;
 mod walk;
@@ -104,7 +105,8 @@ fn cmd_index(args: &[String]) {
                 o.total_secs,
                 if o.used_mft { "MFT" } else { "并行遍历" },
                 match &o.fallback_reason {
-                    Some(r) => format!("（MFT 回退原因：{}）", r),
+                    // CLI 目前只有中文，固定按中文渲染
+                    Some(r) => format!("（MFT 回退原因：{}）", r.text(i18n::Lang::Zh)),
                     None => String::new(),
                 },
                 o.bytes as f64 / 1_048_576.0

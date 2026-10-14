@@ -101,6 +101,28 @@ builds keep the console subsystem, so `cargo run -- bench` behaves normally.
 - Per-drive index management, with an optional "force walk" mode
 - Bundled CJK font, so Chinese filenames render correctly out of the box
 
+### Languages
+
+The interface ships in Chinese and English. At startup the language comes from
+`%APPDATA%\mftfind\ui.ini`, falling back to the system UI language queried via
+`GetUserDefaultUILanguage` — Chinese systems get Chinese, everything else gets
+English. The selector in the top bar switches immediately and remembers the
+choice.
+
+Every string lives in `src/i18n.rs` as two `Strings` tables and the UI code
+contains no literal labels at all. Adding a language means adding a `Lang`
+variant, a table, and one branch each in `strings` / `endonym` / `code` /
+`from_code` — nothing else changes. Parameterised messages use `{}` templates so
+word-order differences (「命中 3 条」 vs "3 hits") stay inside the tables, and
+`cargo test` asserts both tables agree on placeholder counts; a missing
+placeholder silently drops a field rather than failing loudly.
+
+The CJK font is *appended* to the font family rather than prepended, so Latin
+text renders in egui's built-in font and only falls back to SimHei for glyphs it
+lacks.
+
+The CLI subcommands are still Chinese-only — only the GUI is localized.
+
 ## Building
 
 ```sh
@@ -136,12 +158,13 @@ first-build time for a gain that only shows up in the final binary.
 src/
   main.rs      CLI entry points and argument parsing
   gui.rs       egui / eframe interface
+  i18n.rs      UI strings and language selection (Chinese / English)
   build.rs     index construction, path resolution, walk fallback
   mft.rs       FSCTL_ENUM_USN_DATA enumeration
   walk.rs      parallel FindFirstFileExW traversal
   format.rs    binary index format (mmap reader + writer)
   search.rs    tokenizer, matcher, sorting
-  win.rs       thin Win32 wrappers (volume handles, error classification)
+  win.rs       thin Win32 wrappers (volume handles, console setup, errors)
 legacy/
   python-tkinter/   original Python prototype, kept for reference
 ```
