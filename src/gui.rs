@@ -6,6 +6,7 @@
 //! - MFT 索引不含文件大小，只对「当前可见行」惰性调用 metadata 补齐并缓存
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -142,6 +143,10 @@ pub struct App {
     status: Status,
     index_status: Arc<Mutex<IndexStatus>>,
     indexing: bool,
+    /// 后台索引线程完成时置位。界面线程每帧检查它：
+    /// 收到后装载新索引并重跑搜索——**不这么做的话，首次索引完必须手动
+    /// 点「重新加载索引」才能搜到东西**（界面手里的还是启动时的旧 Arc）。
+    indexing_done: Arc<AtomicBool>,
     drives: Vec<DriveItem>,
     show_scope: bool,
     elevated: bool,
@@ -180,6 +185,7 @@ impl App {
             },
             index_status: Arc::new(Mutex::new(IndexStatus::None)),
             indexing: false,
+            indexing_done: Arc::new(AtomicBool::new(false)),
             drives: list_drive_items(),
             show_scope: false,
             elevated,
@@ -255,8 +261,10 @@ impl App {
         }
         self.indexing = true;
         let status = self.index_status.clone();
+        let done = self.indexing_done.clone();
         let ctx = ctx.clone();
         let elevated = self.elevated;
+        done.store(false, Ordering::Relaxed);
         std::thread::spawn(move || {
             for letter in letters {
                 *status.lock().unwrap() = IndexStatus::Start(letter);
@@ -288,10 +296,12 @@ impl App {
                 }
                 ctx.request_repaint();
             }
-            // 全部卷结束，在最终状态上标记「可开始搜索」
+            // 全部卷结束，在最终状态上标记「可开始搜索」，
+            // 并通知界面线程装载新索引
             if let IndexStatus::Done(d) = &mut *status.lock().unwrap() {
                 d.ready = true;
             }
+            done.store(true, Ordering::Relaxed);
             ctx.request_repaint();
         });
     }
@@ -440,6 +450,15 @@ impl eframe::App for App {
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
             self.focus_search = true;
+        }
+
+        // ---------- 索引完成：装载新索引并重搜 ----------
+        // 后台线程只写 indexing_done，装载必须发生在界面线程（self.indexes
+        // 与搜索线程共享）。放在面板之前，spinner 与状态栏当帧就更新。
+        if self.indexing && self.indexing_done.load(Ordering::Relaxed) {
+            self.indexing = false;
+            self.reload_indexes();
+            self.spawn_search(&ctx);
         }
 
         // ---------- 菜单栏 ----------
