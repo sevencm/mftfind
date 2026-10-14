@@ -10,7 +10,7 @@
 set -euo pipefail
 
 RULE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$'
-BRANCH_EXPECTED="${RELEASE_BRANCH:-master}"
+BRANCH_EXPECTED="${RELEASE_BRANCH:-main}"
 
 die() { echo "错误: $*" >&2; exit 1; }
 

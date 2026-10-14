@@ -98,7 +98,7 @@ the source it was built from.
 
 ## Cutting a release
 
-Prerequisites: clean worktree, on `master`, up to date with `origin`.
+Prerequisites: clean worktree, on `main`, up to date with `origin`.
 
 ```sh
 ./scripts/release.sh 0.2.0-alpha.1          # bump, refresh lock, commit, tag
@@ -117,16 +117,16 @@ git commit -m "chore(release): v0.2.0-alpha.1"
 # 4. annotated tag, matching the version exactly
 git tag -a v0.2.0-alpha.1 -m "mftfind v0.2.0-alpha.1"
 # 5. push the commit and the tag — this is what starts the release
-git push origin master && git push origin v0.2.0-alpha.1
+git push origin main && git push origin v0.2.0-alpha.1
 ```
 
 ## What CI does
 
 ### `.github/workflows/ci.yml`
 
-Runs on every push to `master` and every pull request. Builds
+Runs on every push to `main` and every pull request. Builds
 `cargo build --locked --release` on `windows-latest` with the MSVC toolchain and
-reports the binary size. Publishes no artifacts — it only answers "does master
+reports the binary size. Publishes no artifacts — it only answers "does main
 still compile".
 
 ### `.github/workflows/release.yml`
@@ -171,7 +171,7 @@ cutting the next ordinal instead.
 
 ## Not configured
 
-- **Nightly / dev builds.** There is no rolling build from `master`. If one is
+- **Nightly / dev builds.** There is no rolling build from `main`. If one is
   wanted, add a workflow that force-updates a single `dev` tag on every push.
 - **Code signing.** The executable is unsigned, so Windows SmartScreen shows a
   warning on first launch. Signing would need a certificate and `signtool` in
