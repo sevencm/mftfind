@@ -99,7 +99,8 @@ builds keep the console subsystem, so `cargo run -- bench` behaves normally.
 - Sort by name / modified time / size / kind
 - Full size and timestamp columns, read from the index without touching disk
 - Per-drive index management, with an optional "force walk" mode
-- Bundled CJK font, so Chinese filenames render correctly out of the box
+- Chinese and English UI, switchable from the Language menu
+- System font fallback, so Chinese filenames render correctly out of the box
 
 ### Languages
 
@@ -118,9 +119,13 @@ word-order differences (「命中 3 条」 vs "3 hits") stay inside the tables, 
 `cargo test` asserts both tables agree on placeholder counts; a missing
 placeholder silently drops a field rather than failing loudly.
 
-The CJK font is *appended* to the font family rather than prepended, so Latin
-text renders in egui's built-in font and only falls back to SimHei for glyphs it
-lacks.
+Two system fonts are appended to egui's built-in font stack rather than
+prepended, so Latin text keeps rendering in egui's own font and the fallbacks
+only cover what it lacks: **Segoe UI Symbol** for symbols, then a **CJK font**
+(SimHei and friends). The symbol font is not optional — egui 0.36's bundled
+fonts cover only `☐ ● • · √ ★ ☆ → ⛃ ☜`, so a menu check mark would render as an
+empty box without it. A test renders a frame with the real font stack and
+asserts the glyphs are actually present.
 
 The CLI subcommands are still Chinese-only — only the GUI is localized.
 
