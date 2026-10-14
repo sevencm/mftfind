@@ -1,0 +1,22 @@
+[package]
+name = "mftfind"
+version = "0.1.0"
+edition = "2021"
+description = "Near-instant file search for Windows, in the spirit of Everything (direct MFT enumeration via FSCTL_ENUM_USN_DATA + mmap binary index)"
+
+[dependencies]
+# 只保留 Windows 上真正需要的特性。
+# eframe 默认特性会带上 wayland / x11 / accesskit / web_screen_reader，
+# 在 Windows 上完全用不到，却会拉进 smithay-clipboard、wayland-scanner、ashpd 等
+# 几十个无用依赖并显著拖慢编译，所以 default-features = false 后按需开启。
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+memchr = "2"
+rayon = "1"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+# 注意：不要设 codegen-units = 1。它对该 profile 下全部 356 个依赖都生效，
+# 是首次编译的主要耗时来源，而收益只体现在最终二进制上。
