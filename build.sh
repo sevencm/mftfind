@@ -21,13 +21,30 @@ export RUSTUP_HOME="C:/Users/admin/.rustup"
 # 关键：把工具链自带的 dlltool.exe / ld.exe 所在目录加进 PATH（POSIX 形式！）
 export PATH="/c/Users/admin/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained:$PATH"
 
+# 把应用图标写进 exe 的 .rsrc 节（资源管理器/开始菜单里看到的那个）。
+# 本机没有 rc.exe / windres，embed_icon.py 自己往 PE 里加节，幂等可重复跑。
+# 没它也不影响运行：窗口和任务栏图标是 egui 启动时从 assets/icon.rgba 画的。
+embed_icon() {
+  local exe="$1"
+  local py
+  py="$(command -v python || command -v python3 || true)"
+  if [ -n "$py" ]; then
+    "$py" tools/embed_icon.py "$exe"
+  else
+    echo "提示：没找到 python，跳过给 $exe 嵌入文件图标"
+    echo "      （窗口/任务栏图标不受影响，只缺资源管理器里看到的那个）"
+  fi
+}
+
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = "--debug" ]; then
   shift
   "$CARGO" build "$@"
   echo "构建完成: $(pwd)/target/debug/mftfind.exe（控制台子系统，便于看输出）"
+  embed_icon target/debug/mftfind.exe
 else
   "$CARGO" build --release "$@"
   echo "构建完成: $(pwd)/target/release/mftfind.exe（windows 子系统，启动不弹控制台）"
+  embed_icon target/release/mftfind.exe
 fi

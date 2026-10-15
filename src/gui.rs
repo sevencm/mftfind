@@ -839,6 +839,20 @@ fn window_title(lang: Lang) -> String {
     )
 }
 
+/// 128×128 RGBA 像素，由 `tools/make_icon.py` 生成，改图标先改那个脚本再重跑。
+/// 嵌原始像素而不是 PNG：省掉 image 解码依赖，也不用每次启动解码一遍。
+const APP_ICON: &[u8] = include_bytes!("../assets/icon.rgba");
+
+fn app_icon() -> egui::IconData {
+    // 尺寸写死在生成脚本里，这里用常量断言兜底，防止两个文件悄悄脱节。
+    debug_assert_eq!(APP_ICON.len(), 128 * 128 * 4);
+    egui::IconData {
+        rgba: APP_ICON.to_vec(),
+        width: 128,
+        height: 128,
+    }
+}
+
 pub fn run() -> eframe::Result<()> {
     // 语言在这里定一次：读取记住的选择，没有则按系统 UI 语言判断
     let lang = i18n::load();
@@ -846,6 +860,7 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 700.0])
             .with_min_inner_size([720.0, 420.0])
+            .with_icon(app_icon())
             .with_title(window_title(lang)),
         ..Default::default()
     };

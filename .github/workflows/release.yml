@@ -126,6 +126,11 @@ jobs:
       - name: Build
         run: cargo build --locked --release
 
+      # 把图标写进 .rsrc 节，让资源管理器/开始菜单显示应用图标。
+      # 脚本自带的复核会验证资源能被重新解析，失败即终止。
+      - name: Embed icon resource
+        run: python tools/embed_icon.py target/release/mftfind.exe
+
       - name: Package
         shell: pwsh
         env:
