@@ -26,6 +26,20 @@ If elevation is missing, the built-in `FindFirstFileExW` walker (parallelized wi
 **"Restart as Administrator"** button that triggers a UAC prompt and re-launches
 the process onto the fast path.
 
+One trade-off worth knowing: **`FSCTL_ENUM_USN_DATA` gives neither file size nor
+timestamps.** Its records describe changes rather than files, and Microsoft
+documents `TimeStamp`, `Reason` and `SourceInfo` as invalid for the sibling
+`FSCTL_READ_FILE_USN_DATA` call; enumeration behaves the same way in practice —
+sampling the five MFT-built indexes on this machine, 100% of records carried a
+zero timestamp. Everything sidesteps this by reading the `$MFT` byte stream
+directly rather than going through the journal API.
+
+So the MFT path stores those fields as *unknown* (`size = u64::MAX`,
+`mtime = 0`) and the GUI fills them in per visible row with a single
+`fs::metadata` call, cached as you scroll. The walk path has both values from
+`FindFirstFileExW` and never touches the disk again. Sorting by size or modified
+time is therefore only meaningful on walk-built volumes.
+
 ### The index format
 
 A single `.fst` file per volume, designed to be mapped rather than parsed:
@@ -97,7 +111,8 @@ builds keep the console subsystem, so `cargo run -- bench` behaves normally.
 
 - Incremental search — results narrow as you type
 - Sort by name / modified time / size / kind
-- Full size and timestamp columns, read from the index without touching disk
+- Size and modified-time columns; on MFT-built volumes they are filled in from
+  the filesystem for the visible rows as you scroll (see above)
 - Per-drive index management, with an optional "force walk" mode
 - Chinese and English UI, switchable from the Language menu
 - System font fallback, so Chinese filenames render correctly out of the box

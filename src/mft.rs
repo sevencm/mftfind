@@ -76,9 +76,25 @@ fn parse_v2(rec: &[u8], out: &mut Vec<RawRec>) {
         frn,
         parent_frn,
         attrs,
-        mtime: timestamp / 10_000_000 - FILETIME_UNIX_DIFF,
+        mtime: filetime_to_unix(timestamp),
         name,
     });
+}
+
+/// FILETIME（100ns 粒度）→ Unix 秒。**0 表示「未知」并原样保留 0**。
+///
+/// FSCTL_ENUM_USN_DATA 返回的 USN_RECORD 里 TimeStamp 恒为 0：这条枚举路径出自
+/// MFT 而非变更日志，微软只在 FSCTL_READ_FILE_USN_DATA 的文档里写明
+/// TimeStamp / Reason / SourceInfo 为 invalid，实测 ENUM 同样如此
+/// （本机 MFT 建的 5 个卷索引里，采样 100% 的记录时间戳都是 0）。
+/// 若照常减去 FILETIME 偏移，0 会变成 -11644473600，看着像一个 1601 年的日期、
+/// 实际是负数；界面按 `<= 0` 判未知，所以落盘时保持 0 更诚实。
+fn filetime_to_unix(t: i64) -> i64 {
+    if t <= 0 {
+        0
+    } else {
+        t / 10_000_000 - FILETIME_UNIX_DIFF
+    }
 }
 
 /// 枚举一卷的 MFT，构建索引条目。`progress` 会周期性收到已解析记录数。
@@ -190,4 +206,26 @@ pub fn enumerate_volume(
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 枚举路径拿不到时间戳（TimeStamp 恒为 0），落盘时必须保持 0 这个
+    /// 「未知」标记。早先直接减 FILETIME 偏移，0 会变成 -11644473600——
+    /// 一个看着像 1601 年、实际为负的数，界面只好整列留空。
+    #[test]
+    fn zero_timestamp_stays_zero() {
+        assert_eq!(filetime_to_unix(0), 0);
+        assert_eq!(filetime_to_unix(-1), 0, "负数同样视为未知");
+    }
+
+    /// 正常 FILETIME 要能换算成 Unix 秒（1 秒 = 10^7 个 100ns 单位）
+    #[test]
+    fn filetime_converts_to_unix_seconds() {
+        let unix = 1_700_000_000i64;
+        let filetime = (unix + FILETIME_UNIX_DIFF) * 10_000_000;
+        assert_eq!(filetime_to_unix(filetime), unix);
+    }
 }

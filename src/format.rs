@@ -16,11 +16,16 @@
 //!              6..8   flags    u16   bit0=目录 bit1=重解析点 bit2=尺寸已知
 //!              8..12  parent   u32   父记录下标，u32::MAX 表示根
 //!             12..20  size     u64   已知时为字节数，未知时 u64::MAX
-//!             20..28  mtime    i64   unix 秒
+//!             20..28  mtime    i64   unix 秒，<= 0 表示未知（见下）
 //! 之后依次是 search_blob（ASCII 小写名字）与 display_blob（原始大小写名字）
 //! ```
 //! 说明：小写化只处理 ASCII（UTF-8 下字节长度不变），因此两个名字区偏移完全对齐，
 //! 每条记录只需存一份偏移。索引文件本身即 mmap 数据，进程启动无需反序列化。
+//!
+//! **size 与 mtime 可能是未知的**：MFT 枚举路径（`mft.rs`）拿到的 USN_RECORD
+//! 既没有文件大小也没有时间戳，此时 size 写 u64::MAX、mtime 写 0
+//! （FLAG_SIZE_KNOWN 不置位）。界面只对**当前可见行**惰性调用 `fs::metadata`
+//! 补齐这两项，而不是回读百万次磁盘。
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};

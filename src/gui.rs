@@ -42,6 +42,94 @@ struct Meta {
     path_ready_ms: f64,
 }
 
+/// 一行结果里需要补齐的两列，都是**渲染好的字符串**，直接进表格。
+#[derive(Clone)]
+struct RowMeta {
+    size: String,
+    time: String,
+}
+
+/// 补齐索引里缺失的大小与修改时间。
+///
+/// MFT 枚举路径拿不到这两项（USN_RECORD 里既没有文件大小也没有时间戳），
+/// 所以对**当前可见行**调一次 `fs::metadata` 同时取回两者并缓存——
+/// 一次 stat 补两列，而不是各来一次。索引里已有的值不碰磁盘。
+///
+/// 写成自由函数而不是 `&mut self` 方法：调用处同时持有 `&self.indexes`
+/// （借了 self 的一个字段），只有分开借字段才不会冲突。
+fn row_meta(
+    cache: &mut HashMap<(usize, u32), RowMeta>,
+    ix: &Index,
+    vol: usize,
+    idx: u32,
+    path: &str,
+) -> RowMeta {
+    if let Some(m) = cache.get(&(vol, idx)) {
+        return m.clone();
+    }
+
+    let indexed_size = ix.size(idx);
+    let indexed_time = ix.mtime(idx);
+    // 目录的大小一律显示 "-"：NTFS 里目录条目没有有意义的字节数，
+    // 显示 "0 B" 会让人误以为文件夹是空的。文件则用索引里的值，
+    // 缺了（MFT 路径）就去磁盘补。
+    let is_dir = ix.is_dir(idx);
+    let need_size = !is_dir && indexed_size.is_none();
+    let need_time = indexed_time <= 0;
+
+    let mut out = RowMeta {
+        size: match indexed_size {
+            Some(s) if !is_dir && s != u64::MAX => human_size(s),
+            _ => UNKNOWN.to_string(),
+        },
+        time: fmt_time(indexed_time),
+    };
+
+    // 只有确实缺字段时才碰磁盘
+    if need_size || need_time {
+        if let Some((size, time)) = meta_from_disk(path, is_dir) {
+            if need_size {
+                if let Some(s) = size {
+                    out.size = s;
+                }
+            }
+            if need_time {
+                if let Some(t) = time {
+                    out.time = t;
+                }
+            }
+        }
+        // 读不到（权限/已删除）就保持 "-"：比留空更明确
+    }
+
+    cache.insert((vol, idx), out.clone());
+    out
+}
+
+/// 从文件系统读一行的（大小文本，时间文本）。两项都是 `Option`：
+/// 目录没有有意义的大小，时间也可能取不到。整条路径都失败时返回 `None`。
+///
+/// 抽出来是为了能测——`row_meta` 需要 `&Index`（要 mmap 一个 .fst），
+/// 这一段只依赖路径，可以直接对临时文件断言。
+fn meta_from_disk(path: &str, is_dir: bool) -> Option<(Option<String>, Option<String>)> {
+    let md = std::fs::metadata(path).ok()?;
+    let size = if is_dir {
+        None
+    } else {
+        Some(human_size(md.len()))
+    };
+    let time = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| fmt_time(d.as_secs() as i64))
+        .filter(|s| !s.is_empty());
+    Some((size, time))
+}
+
+/// 读不到时的占位符
+const UNKNOWN: &str = "-";
+
 /// 状态栏消息。**存结构化数据而不是渲染好的字符串**——
 /// 字符串在生成那一刻就固定了语言，切换语言后旧文案不会跟着变
 /// （首次切语言的 bug 根因）。绘制时才用当前语言渲染。
@@ -138,7 +226,8 @@ pub struct App {
     hits: Arc<Mutex<Vec<Hit>>>,
     meta: Arc<Mutex<Meta>>,
     generation: u64,
-    size_cache: HashMap<(usize, u32), String>,
+    /// 可见行的惰性补齐缓存（大小 + 修改时间），键为 (卷号, 记录下标)
+    meta_cache: HashMap<(usize, u32), RowMeta>,
     selected: Option<usize>,
     status: Status,
     index_status: Arc<Mutex<IndexStatus>>,
@@ -176,7 +265,7 @@ impl App {
                 path_ready_ms: 0.0,
             })),
             generation: 0,
-            size_cache: HashMap::new(),
+            meta_cache: HashMap::new(),
             selected: None,
             status: if elevated {
                 Status::Elevated
@@ -251,7 +340,7 @@ impl App {
     fn reload_indexes(&mut self) {
         self.indexes = Arc::new(load_indexes());
         self.total_records = self.indexes.iter().map(|i| i.count as usize).sum();
-        self.size_cache.clear();
+        self.meta_cache.clear();
         self.drives = list_drive_items();
     }
 
@@ -409,6 +498,8 @@ fn human_size(n: u64) -> String {
     }
 }
 
+/// Unix 秒 → `YYYY/MM/DD HH:MM`。`ts <= 0` 是本项目约定的「时间未知」，
+/// 返回空串，由调用方决定显示什么占位。
 fn fmt_time(ts: i64) -> String {
     if ts <= 0 {
         return String::new();
@@ -652,21 +743,10 @@ impl eframe::App for App {
                         let full = ix.full_path(h.idx);
                         let name = ix.name(h.idx).to_string();
 
-                        // 惰性补齐文件大小（MFT 索引里没有尺寸）
-                        let size_text = match ix.size(h.idx) {
-                            Some(s) if s != u64::MAX => human_size(s),
-                            _ => {
-                                if let Some(cached) = self.size_cache.get(&(h.vol, h.idx)) {
-                                    cached.clone()
-                                } else {
-                                    let t = std::fs::metadata(&full)
-                                        .map(|m| human_size(m.len()))
-                                        .unwrap_or_else(|_| "-".to_string());
-                                    self.size_cache.insert((h.vol, h.idx), t.clone());
-                                    t
-                                }
-                            }
-                        };
+                        // 大小与修改时间：索引里缺的（MFT 路径两项都没有）
+                        // 就对这一行 stat 一次补齐，结果进缓存
+                        let row = row_meta(&mut self.meta_cache, ix, h.vol, h.idx, &full);
+                        let size_text = row.size;
 
                         if self.selected == Some(i) {
                             let rect = ui.max_rect();
@@ -699,7 +779,7 @@ impl eframe::App for App {
                                     .truncate(),
                                 );
                                 ui.add_sized([w_size, row_h], egui::Label::new(size_text));
-                                ui.add_sized([w_time, row_h], egui::Label::new(fmt_time(ix.mtime(h.idx))));
+                                ui.add_sized([w_time, row_h], egui::Label::new(row.time));
                             })
                             .response
                             .interact(egui::Sense::click());
@@ -811,5 +891,43 @@ mod tests {
         );
         // 顺带确认 CJK 字体那一路回退也还在（中文界面全靠它）
         assert!(renders("中"), "CJK 字体回退失效，中文会显示成豆腐块");
+    }
+
+    /// 时间戳的「未知」约定：<= 0 一律不显示。
+    /// MFT 枚举路径拿不到时间戳，落盘时写 0；旧索引里还有 -11644473600
+    /// （FILETIME 0 减偏移的产物），两种都得当未知处理，否则会显示成 1601 年。
+    #[test]
+    fn non_positive_timestamps_are_unknown() {
+        assert!(fmt_time(0).is_empty());
+        assert!(fmt_time(-11_644_473_600).is_empty());
+        assert!(fmt_time(-1).is_empty());
+        assert!(!fmt_time(1_700_000_000).is_empty());
+        assert_eq!(fmt_time(1_700_000_000).len(), 16); // YYYY/MM/DD HH:MM
+    }
+
+    /// 索引里缺的大小与时间能不能从文件系统补上——MFT 路径靠的就是这条兜底。
+    #[test]
+    fn missing_fields_are_filled_from_disk() {
+        let dir = std::env::temp_dir().join(format!("mftfind-fill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.bin");
+        std::fs::write(&file, vec![0u8; 2048]).unwrap();
+
+        let (size, time) = meta_from_disk(&file.to_string_lossy(), false).expect("文件应当能读到");
+        assert_eq!(size.as_deref(), Some("2.0 KB"), "大小应按索引外的真实值补齐");
+        let time = time.expect("文件系统能给出修改时间");
+        assert_eq!(time.len(), 16, "时间格式应为 YYYY/MM/DD HH:MM，实际 {time:?}");
+        assert_eq!(time.as_bytes()[4], b'/');
+
+        // 目录：大小留空（显示为 "-"），时间照样要有
+        let (size, time) = meta_from_disk(&dir.to_string_lossy(), true).expect("目录应当能读到");
+        assert!(size.is_none(), "目录不应报出字节数");
+        assert!(time.is_some(), "目录也有修改时间");
+
+        // 不存在的路径：整条失败，调用方保持 "-"
+        let missing = dir.join("no-such-file");
+        assert!(meta_from_disk(&missing.to_string_lossy(), false).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
