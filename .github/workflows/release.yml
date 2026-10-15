@@ -23,6 +23,8 @@ jobs:
   verify:
     name: Verify tag
     runs-on: ubuntu-latest
+    # 只做 checkout + 正则/版本比对，秒级完成。
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       version: ${{ steps.check.outputs.version }}
@@ -104,6 +106,8 @@ jobs:
     name: Build and package
     needs: verify
     runs-on: windows-latest
+    # 冷缓存下 MSVC release 构建约 3 分钟；与 CI 保持同一个上限。
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -153,6 +157,8 @@ jobs:
     name: Publish GitHub Release
     needs: [verify, build]
     runs-on: ubuntu-latest
+    # 只是下载制品 + 调 gh 建 release。
+    timeout-minutes: 10
 
     steps:
       - name: Download assets
