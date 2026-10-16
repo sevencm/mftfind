@@ -1,7 +1,13 @@
 # mftfind
 
 Windows 上近乎即时的文件名搜索工具，思路源自 [Everything](https://www.voidtools.com/)，
-但体积更小、索引格式不落纯文本、引擎用原生 Rust 写成。
+用 Rust 从零实现，小到可以通读一遍。
+
+**这不是 Everything 的替代品，也不比它小。**
+Everything 的 64 位便携版压缩包 1.8 MB；本项目的发布包 3.0 MB，解开后的二进制还要更大。
+Everything 的索引文件同样是二进制的，所以索引格式也不是差异点。
+mftfind 提供的是「更少」的反面：约 3,300 行 Rust 覆盖整条链路——
+MFT 枚举、索引布局、查询路径——一个下午能读完，改动起来不用怕。
 
 `mftfind` 通过 `FSCTL_ENUM_USN_DATA` 直接枚举 NTFS 主文件表（MFT），写入自有的二进制索引，
 查询时用 mmap 把索引映射进内存，因此搜索的**反序列化开销为零**。

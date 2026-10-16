@@ -3,7 +3,15 @@
 [简体中文](README.zh-CN.md)
 
 Near-instant file search for Windows, in the spirit of [Everything](https://www.voidtools.com/)
-— but with a smaller footprint, a plain-text-free index format, and a native Rust engine.
+— a from-scratch Rust implementation, small enough to read end to end.
+
+**This is not an Everything replacement, and it is not a smaller one.**
+Everything's 64-bit portable ZIP is 1.8 MB; this project's release package is
+3.0 MB, and its binary is larger than that again. Everything's index files are
+binary as well, so the index format is not a differentiator either. What mftfind
+offers is the opposite of more: the entire pipeline in ~3,300 lines of Rust —
+MFT enumeration, index layout, and query path — small enough to read in an
+afternoon and modify without fear.
 
 `mftfind` enumerates the NTFS Master File Table directly through
 `FSCTL_ENUM_USN_DATA`, writes a custom binary index, and memory-maps that index at
