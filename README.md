@@ -1,5 +1,7 @@
 # mftfind
 
+[简体中文](README.zh-CN.md)
+
 Near-instant file search for Windows, in the spirit of [Everything](https://www.voidtools.com/)
 — but with a smaller footprint, a plain-text-free index format, and a native Rust engine.
 

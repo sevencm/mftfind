@@ -140,7 +140,7 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path staging, dist | Out-Null
           Copy-Item target/release/mftfind.exe staging/
-          Copy-Item mftfind.bat, README.md staging/
+          Copy-Item mftfind.bat, README.md, README.zh-CN.md staging/
           Compress-Archive -Path staging/* -DestinationPath "dist/$name.zip" -Force -CompressionLevel Optimal
 
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
