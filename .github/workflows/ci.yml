@@ -40,6 +40,12 @@ jobs:
       - name: Build
         run: cargo build --locked --release
 
+      # 发布流程会跑这一步（把图标写进 .rsrc 节）。在 CI 里也跑，是为了让
+      # 「只有打 tag 时才发现嵌图标挂了」这种事不再发生——alpha.2 就是这么
+      # 白丢一个序数的。
+      - name: Embed icon resource
+        run: python tools/embed_icon.py target/release/mftfind.exe
+
       - name: Report binary size
         shell: pwsh
         run: |

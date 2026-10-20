@@ -23,6 +23,14 @@ import os
 import struct
 import sys
 
+# 不要假设控制台是 UTF-8。CI 的 Windows runner 把 stdout 接到管道后用的是
+# en-US 的 cp1252，打印中文会抛 UnicodeEncodeError 直接以 1 退出——v0.2.0-alpha.2
+# 的发布就是栽在这里（本地是 cp936，一直看不出来）。
+# errors="replace" 保证任何字符集下都不会因为一句日志而失败。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # 资源类型
 RT_ICON = 3
 RT_GROUP_ICON = 14

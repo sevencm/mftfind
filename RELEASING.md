@@ -125,9 +125,10 @@ git push origin main && git push origin v0.2.0-alpha.1
 ### `.github/workflows/ci.yml`
 
 Runs on every push to `main` and every pull request. Builds
-`cargo build --locked --release` on `windows-latest` with the MSVC toolchain and
-reports the binary size. Publishes no artifacts — it only answers "does main
-still compile".
+`cargo build --locked --release` on `windows-latest` with the MSVC toolchain,
+runs `tools/embed_icon.py` on the result, and reports the binary size. Publishes
+no artifacts — it answers "does main still compile" and "does the icon still
+embed", so a broken packaging step fails on `main` instead of on a tag.
 
 ### `.github/workflows/release.yml`
 
