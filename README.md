@@ -123,6 +123,10 @@ builds keep the console subsystem, so `cargo run -- bench` behaves normally.
 - Sort by name / modified time / size / kind
 - Size and modified-time columns; on MFT-built volumes they are filled in from
   the filesystem for the visible rows as you scroll (see above)
+- Open a result, reveal it in Explorer, or copy its full path — four ways in:
+  the toolbar button, the right-click menu, `Enter` / `Ctrl+Enter` / `Ctrl+C`,
+  or double-clicking the path column
+- `↑` / `↓` move the selection without leaving the search box
 - Per-drive index management, with an optional "force walk" mode
 - Chinese and English UI, switchable from the Language menu
 - System font fallback, so Chinese filenames render correctly out of the box

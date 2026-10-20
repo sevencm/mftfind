@@ -155,6 +155,17 @@ impl Status {
     }
 }
 
+/// 对某一结果行要执行的动作。
+///
+/// 右键菜单、工具栏按钮、键盘快捷键、双击路径列四个入口都只负责**产生**
+/// 这个枚举，真正的副作用统一在结果表绘制完之后执行一次。否则每条路径
+/// 各自调 ShellExecute，错误处理和状态栏消息会散成四份。
+enum RowAction {
+    Open { path: String, is_dir: bool },
+    Reveal(String),
+    Copy(String),
+}
+
 /// 单卷索引结果（供状态栏按当前语言渲染）
 struct VolumeDone {
     letter: char,
@@ -220,7 +231,10 @@ struct DriveItem {
 pub struct App {
     indexes: Arc<Vec<Index>>,
     query: String,
-    last_query: String,
+    /// 上次发起搜索时的 (查询词, 排序, 路径模式)。
+    /// 三者任一变化都要重搜——早先只盯查询词，导致改排序或勾「路径」
+    /// 之后结果不变，得等下次输入才生效。
+    last_key: (String, SortBy, bool),
     path_mode: bool,
     sort: SortBy,
     hits: Arc<Mutex<Vec<Hit>>>,
@@ -229,6 +243,11 @@ pub struct App {
     /// 可见行的惰性补齐缓存（大小 + 修改时间），键为 (卷号, 记录下标)
     meta_cache: HashMap<(usize, u32), RowMeta>,
     selected: Option<usize>,
+    /// 方向键刚移动过选中行，这一帧要把该行滚进视野。
+    ///
+    /// 列表是虚拟滚动的（只画可见行），`ui.scroll_to_rect` 够不到视野外的行，
+    /// 所以改成直接设滚动偏移；否则按方向键选到第 50 行时屏幕上看不到任何变化。
+    scroll_to_selected: bool,
     status: Status,
     index_status: Arc<Mutex<IndexStatus>>,
     indexing: bool,
@@ -254,7 +273,7 @@ impl App {
         let mut app = App {
             indexes,
             query: String::new(),
-            last_query: String::new(),
+            last_key: (String::new(), SortBy::Name, false),
             path_mode: false,
             sort: SortBy::Name,
             hits: Arc::new(Mutex::new(Vec::new())),
@@ -267,6 +286,7 @@ impl App {
             generation: 0,
             meta_cache: HashMap::new(),
             selected: None,
+            scroll_to_selected: false,
             status: if elevated {
                 Status::Elevated
             } else {
@@ -284,6 +304,80 @@ impl App {
         };
         app.spawn_search(&cc.egui_ctx);
         app
+    }
+
+    /// 当前选中行的完整路径。
+    ///
+    /// 命中集由搜索线程异步替换，行号可能已经越界或指向别的文件，
+    /// 所以这里一律按「拿不到」处理，调用方不必自己判断。
+    fn selected_path(&self) -> Option<String> {
+        let i = self.selected?;
+        let (vol, idx) = {
+            let hits = self.hits.lock().unwrap();
+            let h = hits.get(i)?;
+            (h.vol, h.idx)
+        };
+        Some(self.indexes.get(vol)?.full_path(idx))
+    }
+
+    /// 处理结果区快捷键，返回要执行的行操作。
+    ///
+    /// 必须在任何控件绘制之前调用：单行 TextEdit 会消费 Enter、ComboBox 会
+    /// 消费方向键，等面板画完再读这些事件就已经被吃掉了。
+    fn handle_result_keys(&mut self, ctx: &egui::Context) -> Option<RowAction> {
+        let (down, up, open, reveal, copy) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                !i.modifiers.command && i.key_pressed(egui::Key::Enter),
+                i.modifiers.command && i.key_pressed(egui::Key::Enter),
+                // 输入框有焦点时 Ctrl+C 必须留给文本复制，不能抢
+                i.modifiers.command && !ctx.egui_wants_keyboard_input() && i.key_pressed(egui::Key::C),
+            )
+        });
+        if !(down || up || open || reveal || copy) {
+            return None;
+        }
+
+        // 命中集由搜索线程异步替换，行号可能已经越界 —— 一律当「没选中」
+        let (n, cur) = {
+            let hits = self.hits.lock().unwrap();
+            let n = hits.len();
+            (n, self.selected.filter(|&i| i < n))
+        };
+        if n == 0 {
+            return None;
+        }
+
+        if down || up {
+            let next = next_selection(cur, n, up);
+            // 已经在首/末行时 next == cur，此时不该重置滚动位置
+            self.scroll_to_selected = next != cur;
+            self.selected = next;
+        }
+
+        if !(open || reveal || copy) {
+            return None;
+        }
+        // 没有选中行时按 Enter 什么都不做，而不是猜一个目标
+        let i = cur?;
+        let (vol, idx) = {
+            let hits = self.hits.lock().unwrap();
+            let h = *hits.get(i)?;
+            (h.vol, h.idx)
+        };
+        let ix = self.indexes.get(vol)?;
+        let path = ix.full_path(idx);
+        Some(if reveal {
+            RowAction::Reveal(path)
+        } else if copy {
+            RowAction::Copy(path)
+        } else {
+            RowAction::Open {
+                path,
+                is_dir: ix.is_dir(idx),
+            }
+        })
     }
 
     /// 后台线程执行搜索
@@ -543,11 +637,17 @@ impl eframe::App for App {
             self.focus_search = true;
         }
 
+        // 结果行操作由四个入口产生：快捷键、工具栏按钮、双击路径列、右键菜单。
+        // 这里先收快捷键那一路，其余三路在各自的控件里写同一个变量。
+        let mut row_action = self.handle_result_keys(&ctx);
+
         // ---------- 索引完成：装载新索引并重搜 ----------
         // 后台线程只写 indexing_done，装载必须发生在界面线程（self.indexes
         // 与搜索线程共享）。放在面板之前，spinner 与状态栏当帧就更新。
         if self.indexing && self.indexing_done.load(Ordering::Relaxed) {
             self.indexing = false;
+            // 索引换了，命中集整个作废；旧行号不能再代表同一个文件
+            self.selected = None;
             self.reload_indexes();
             self.spawn_search(&ctx);
         }
@@ -617,6 +717,17 @@ impl eframe::App for App {
                 if !self.elevated && ui.button(s.restart_admin).clicked() {
                     let _ = win::restart_as_admin("");
                 }
+                ui.separator();
+                // 与右键菜单同一个操作，摆出来是为了不用记快捷键也能发现它。
+                // 没有选中行时置灰而不是隐藏——隐藏会让人以为功能不存在。
+                let sel = self.selected_path();
+                let btn = ui.add_enabled(sel.is_some(), egui::Button::new(s.menu_reveal));
+                if btn.clicked() {
+                    if let Some(p) = sel {
+                        row_action = Some(RowAction::Reveal(p));
+                    }
+                }
+                let _ = btn.on_hover_text(s.shortcut_tip("Ctrl+Enter"));
                 // 按当前语言渲染；后台线程随时可能改写，绘制完立刻释放锁
                 let st = {
                     let st = self.index_status.lock().unwrap();
@@ -704,8 +815,13 @@ impl eframe::App for App {
         }
 
         // ---------- 查询变化触发搜索 ----------
-        if self.query != self.last_query {
-            self.last_query = self.query.clone();
+        // 查询词 / 排序 / 路径模式任一变化都要重搜
+        let key = (self.query.clone(), self.sort, self.path_mode);
+        if key != self.last_key {
+            self.last_key = key;
+            // 结果集马上要换，旧的行号不再代表同一个文件。
+            // 不清掉的话，改完查询按 Enter 会打开上一次结果里的那一行。
+            self.selected = None;
             self.spawn_search(&ctx);
         }
 
@@ -729,13 +845,17 @@ impl eframe::App for App {
             let hit_list = self.hits.lock().unwrap().clone();
             let n = hit_list.len();
 
-            let mut open_path: Option<(String, bool)> = None;
-            let mut reveal: Option<String> = None;
-            let mut copy: Option<String> = None;
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show_rows(ui, row_h, n, |ui, range| {
+            let mut sa = egui::ScrollArea::vertical().auto_shrink([false; 2]);
+            if self.scroll_to_selected {
+                self.scroll_to_selected = false;
+                if let Some(sel) = self.selected {
+                    // 把选中行放到可视区中线附近，而不是贴边
+                    let view_h = ui.available_height();
+                    let center = sel as f32 * row_h + row_h / 2.0;
+                    sa = sa.vertical_scroll_offset((center - view_h / 2.0).max(0.0));
+                }
+            }
+            sa.show_rows(ui, row_h, n, |ui, range| {
                     for i in range {
                         let h = hit_list[i];
                         let ix = &self.indexes[h.vol];
@@ -760,6 +880,9 @@ impl eframe::App for App {
                             );
                         }
 
+                        // 记下「路径」列的矩形：双击要用它区分「打开文件」和
+                        // 「打开所在目录」。整行是一个响应，分不出点在哪一列。
+                        let mut path_rect: Option<egui::Rect> = None;
                         let resp = ui
                             .horizontal(|ui| {
                                 let name_text = if is_dir {
@@ -771,13 +894,14 @@ impl eframe::App for App {
                                     [w_name, row_h],
                                     egui::Label::new(name_text).truncate(),
                                 );
-                                ui.add_sized(
+                                let path_resp = ui.add_sized(
                                     [w_path, row_h],
                                     egui::Label::new(
                                         egui::RichText::new(parent_of(&full)).weak(),
                                     )
                                     .truncate(),
                                 );
+                                path_rect = Some(path_resp.rect);
                                 ui.add_sized([w_size, row_h], egui::Label::new(size_text));
                                 ui.add_sized([w_time, row_h], egui::Label::new(row.time));
                             })
@@ -786,40 +910,80 @@ impl eframe::App for App {
 
                         if resp.clicked() {
                             self.selected = Some(i);
+                            // 把焦点从搜索框收回来，否则之后按 Ctrl+C 会被输入框
+                            // 当作文本复制吃掉
+                            resp.surrender_focus();
                         }
                         if resp.double_clicked() {
-                            open_path = Some((full.clone(), is_dir));
+                            // 双击路径列 = 打开所在目录；双击其他列 = 打开文件
+                            let on_path = resp
+                                .interact_pointer_pos()
+                                .zip(path_rect)
+                                .is_some_and(|(p, r)| r.contains(p));
+                            row_action = Some(if on_path {
+                                RowAction::Reveal(full.clone())
+                            } else {
+                                RowAction::Open {
+                                    path: full.clone(),
+                                    is_dir,
+                                }
+                            });
                         }
                         resp.context_menu(|ui| {
                             if ui.button(s.menu_open).clicked() {
-                                open_path = Some((full.clone(), is_dir));
+                                row_action = Some(RowAction::Open {
+                                    path: full.clone(),
+                                    is_dir,
+                                });
                             }
                             if ui.button(s.menu_reveal).clicked() {
-                                reveal = Some(full.clone());
+                                row_action = Some(RowAction::Reveal(full.clone()));
                             }
                             if ui.button(s.menu_copy).clicked() {
-                                copy = Some(full.clone());
+                                row_action = Some(RowAction::Copy(full.clone()));
                             }
                         });
                     }
                 });
 
-            if let Some((p, d)) = open_path {
-                if let Err(e) = win::open_path(&p, d) {
+        });
+
+        // ---------- 行操作统一执行 ----------
+        // 快捷键 / 工具栏按钮 / 双击 / 右键菜单四处只负责产生 RowAction，
+        // 副作用集中在这里，错误处理和状态栏消息就只有一份
+        match row_action {
+            Some(RowAction::Open { path, is_dir }) => {
+                if let Err(e) = win::open_path(&path, is_dir) {
                     self.status = Status::OpenFailed(e.to_string());
                 }
             }
-            if let Some(p) = reveal {
-                if let Err(e) = win::reveal_in_explorer(&p) {
+            Some(RowAction::Reveal(path)) => {
+                if let Err(e) = win::reveal_in_explorer(&path) {
                     self.status = Status::RevealFailed(e.to_string());
                 }
             }
-            if let Some(p) = copy {
-                ctx.copy_text(p);
+            Some(RowAction::Copy(path)) => {
+                ctx.copy_text(path);
                 self.status = Status::Copied;
             }
-        });
+            None => {}
+        }
     }
+}
+
+/// 方向键移动后的落点，`cur` 为 None 表示当前没有选中行。
+///
+/// 抽成纯函数是为了能测边界：只有一行、已在首行/末行、还没有选中。
+fn next_selection(cur: Option<usize>, n: usize, up: bool) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    Some(match (cur, up) {
+        (Some(i), false) => (i + 1).min(n - 1),
+        (Some(i), true) => i.saturating_sub(1),
+        (None, false) => 0,
+        (None, true) => n - 1,
+    })
 }
 
 fn parent_of(path: &str) -> String {
@@ -944,5 +1108,28 @@ mod tests {
         assert!(meta_from_disk(&missing.to_string_lossy(), false).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arrow_keys_stay_inside_the_list() {
+        // 没有选中时，↓ 落到首行、↑ 落到末行
+        assert_eq!(next_selection(None, 3, false), Some(0));
+        assert_eq!(next_selection(None, 3, true), Some(2));
+
+        // 常规移动
+        assert_eq!(next_selection(Some(1), 3, false), Some(2));
+        assert_eq!(next_selection(Some(1), 3, true), Some(0));
+
+        // 边界夹紧，不越界也不回绕（回绕会让人按到底突然跳回开头）
+        assert_eq!(next_selection(Some(2), 3, false), Some(2));
+        assert_eq!(next_selection(Some(0), 3, true), Some(0));
+
+        // 只有一行
+        assert_eq!(next_selection(None, 1, false), Some(0));
+        assert_eq!(next_selection(Some(0), 1, true), Some(0));
+
+        // 空结果集：不选中任何东西
+        assert_eq!(next_selection(None, 0, false), None);
+        assert_eq!(next_selection(Some(0), 0, true), None);
     }
 }

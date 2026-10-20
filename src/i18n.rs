@@ -105,10 +105,12 @@ pub struct Strings {
     pub col_size: &'static str,
     pub col_modified: &'static str,
 
-    // ---------- 右键菜单 ----------
+    // ---------- 结果行操作（右键菜单与工具栏按钮共用同一套文案） ----------
     pub menu_open: &'static str,
     pub menu_reveal: &'static str,
     pub menu_copy: &'static str,
+    /// 工具栏按钮的悬停提示，参数是键名（键名本身不翻译，只有这句话要翻译）
+    pub shortcut_tip_tmpl: &'static str,
     pub open_failed_tmpl: &'static str,
     pub reveal_failed_tmpl: &'static str,
 
@@ -173,6 +175,12 @@ impl Strings {
 
     pub fn reveal_failed(&self, err: impl Display) -> String {
         fill(self.reveal_failed_tmpl, &[&err])
+    }
+
+    /// 快捷键提示。参数是键名——键名各语言一致（键盘上印的就是那个），
+    /// 需要翻译的只有「快捷键」这几个字。
+    pub fn shortcut_tip(&self, keys: impl Display) -> String {
+        fill(self.shortcut_tip_tmpl, &[&keys])
     }
 }
 
@@ -259,8 +267,9 @@ const ZH: Strings = Strings {
     col_modified: "修改时间",
 
     menu_open: "打开",
-    menu_reveal: "打开所在文件夹",
+    menu_reveal: "打开所在目录",
     menu_copy: "复制完整路径",
+    shortcut_tip_tmpl: "快捷键 {}",
     open_failed_tmpl: "打开失败：{}",
     reveal_failed_tmpl: "打开目录失败：{}",
 
@@ -316,6 +325,7 @@ const EN: Strings = Strings {
     menu_open: "Open",
     menu_reveal: "Open containing folder",
     menu_copy: "Copy full path",
+    shortcut_tip_tmpl: "Shortcut {}",
     open_failed_tmpl: "Could not open: {}",
     reveal_failed_tmpl: "Could not show in Explorer: {}",
 
@@ -381,7 +391,7 @@ mod tests {
     /// 所有带参数的模板配对。
     /// 中英两版的占位符个数必须一致——少一个 `{}` 不会 panic，
     /// 只会让界面静默少显示一段信息（例如丢掉「扫描 1.5s」），很难靠肉眼发现。
-    fn template_pairs() -> [(&'static str, &'static str); 10] {
+    fn template_pairs() -> [(&'static str, &'static str); 11] {
         [
             (ZH.indexing_start_tmpl, EN.indexing_start_tmpl),
             (ZH.indexing_progress_tmpl, EN.indexing_progress_tmpl),
@@ -391,6 +401,7 @@ mod tests {
             (ZH.volumes_and_records_tmpl, EN.volumes_and_records_tmpl),
             (ZH.hit_count_tmpl, EN.hit_count_tmpl),
             (ZH.search_ms_tmpl, EN.search_ms_tmpl),
+            (ZH.shortcut_tip_tmpl, EN.shortcut_tip_tmpl),
             (ZH.open_failed_tmpl, EN.open_failed_tmpl),
             (ZH.reveal_failed_tmpl, EN.reveal_failed_tmpl),
         ]
@@ -440,6 +451,7 @@ mod tests {
                 s.search_ms(150.0),
                 s.open_failed("err"),
                 s.reveal_failed("err"),
+                s.shortcut_tip("Ctrl+Enter"),
             ];
             for text in samples {
                 assert!(!text.contains("{}"), "存在未替换的占位符: {text:?}");
