@@ -166,11 +166,43 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+          # 生成发布说明要遍历区间内的提交和所有 tag，浅克隆拿不到。
+          fetch-depth: 0
+
       - name: Download assets
         uses: actions/download-artifact@v4
         with:
           name: release-assets
           path: dist
+
+      # 不用 `--generate-notes`：它只汇总「合并进来的 PR」，而本项目直接推 main，
+      # 于是正文里只剩一行 Full Changelog（v0.2.0-alpha.3 就是这样）。
+      # scripts/release_notes.sh 改从 git log 生成，并按前缀分组。
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 基线取「上一次真正发布过」的 tag，而不是相邻 tag：中间可能有打歪、
+          # 没发出 release 的序号（v0.2.0-alpha.2 就是），按相邻 tag 会丢掉
+          # 这一段里的提交。都没有时才退回最近的 tag。
+          PREV="$(gh release list --limit 30 --exclude-drafts --json tagName \
+                    --jq '.[].tagName' | grep -vx "$TAG" | head -1 || true)"
+          if [ -z "$PREV" ]; then
+            PREV="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
+          fi
+          echo "previous release: ${PREV:-<none>}"
+
+          bash scripts/release_notes.sh "$TAG" "$PREV" > notes.md
+          echo
+          cat notes.md
 
       - name: Create or update the release
         env:
@@ -189,10 +221,11 @@ jobs:
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — replacing its assets."
+            echo "Release $TAG already exists — replacing its assets and notes."
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md
           else
-            ARGS=(--title "$TITLE" --generate-notes)
+            ARGS=(--title "$TITLE" --notes-file notes.md)
             if [ "$PRERELEASE" = "true" ]; then
               ARGS+=(--prerelease)
             fi
