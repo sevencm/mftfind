@@ -248,6 +248,12 @@ pub struct App {
     /// 列表是虚拟滚动的（只画可见行），`ui.scroll_to_rect` 够不到视野外的行，
     /// 所以改成直接设滚动偏移；否则按方向键选到第 50 行时屏幕上看不到任何变化。
     scroll_to_selected: bool,
+    /// 最近一次操作发生在结果列表而不是搜索框。
+    ///
+    /// 搜索框始终持有焦点（这样点完结果接着打字仍然落在搜索框里），
+    /// 所以判断不了「用户在操作谁」。这里显式记录：点结果行置 true，
+    /// 在搜索框里点击或打字置 false。`Ctrl+C` 靠它决定复制路径还是复制文本。
+    list_active: bool,
     status: Status,
     index_status: Arc<Mutex<IndexStatus>>,
     indexing: bool,
@@ -287,6 +293,7 @@ impl App {
             meta_cache: HashMap::new(),
             selected: None,
             scroll_to_selected: false,
+            list_active: false,
             status: if elevated {
                 Status::Elevated
             } else {
@@ -325,14 +332,15 @@ impl App {
     /// 必须在任何控件绘制之前调用：单行 TextEdit 会消费 Enter、ComboBox 会
     /// 消费方向键，等面板画完再读这些事件就已经被吃掉了。
     fn handle_result_keys(&mut self, ctx: &egui::Context) -> Option<RowAction> {
+        // 用户在操作结果列表（而不是搜索框）时才抢 Ctrl+C，否则那是文本复制
+        let list_active = self.list_active;
         let (down, up, open, reveal, copy) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::ArrowUp),
                 !i.modifiers.command && i.key_pressed(egui::Key::Enter),
                 i.modifiers.command && i.key_pressed(egui::Key::Enter),
-                // 输入框有焦点时 Ctrl+C 必须留给文本复制，不能抢
-                i.modifiers.command && !ctx.egui_wants_keyboard_input() && i.key_pressed(egui::Key::C),
+                list_active && i.modifiers.command && i.key_pressed(egui::Key::C),
             )
         });
         if !(down || up || open || reveal || copy) {
@@ -354,6 +362,8 @@ impl App {
             // 已经在首/末行时 next == cur，此时不该重置滚动位置
             self.scroll_to_selected = next != cur;
             self.selected = next;
+            // 用方向键浏览结果 = 在操作列表，之后 Ctrl+C 该复制路径
+            self.list_active = true;
         }
 
         if !(open || reveal || copy) {
@@ -636,6 +646,10 @@ impl eframe::App for App {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
             self.focus_search = true;
         }
+        // 一打字就说明回到搜索了：之后 Ctrl+C 该复制文本，不是复制选中行的路径
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_)))) {
+            self.list_active = false;
+        }
 
         // 结果行操作由四个入口产生：快捷键、工具栏按钮、双击路径列、右键菜单。
         // 这里先收快捷键那一路，其余三路在各自的控件里写同一个变量。
@@ -689,6 +703,10 @@ impl eframe::App for App {
                 if self.focus_search {
                     resp.request_focus();
                     self.focus_search = false;
+                }
+                // 在搜索框里点一下，之后 Ctrl+C 就应该是复制文本而不是复制路径
+                if resp.clicked() {
+                    self.list_active = false;
                 }
                 ui.checkbox(&mut self.path_mode, s.path_mode);
                 egui::ComboBox::from_id_salt("sort")
@@ -914,18 +932,13 @@ impl eframe::App for App {
 
                         if resp.clicked() {
                             self.selected = Some(i);
+                            self.list_active = true;
                         }
                         // 右键也算「指到了这一行」：先选中，菜单里的操作和工具栏按钮
                         // 才指向同一个文件，不用再点一次左键
                         if resp.secondary_clicked() {
                             self.selected = Some(i);
-                        }
-                        if resp.clicked() || resp.secondary_clicked() {
-                            // 焦点必须从搜索框真正收回来，否则 Ctrl+C 会被输入框
-                            // 当作文本复制吃掉。注意 Response::surrender_focus() 只在
-                            // 「焦点本来就在自己身上」时才生效，对搜索框无效，
-                            // 所以直接清掉当前焦点。
-                            ui.ctx().memory_mut(|m| m.stop_text_input());
+                            self.list_active = true;
                         }
                         if resp.double_clicked() {
                             // 双击路径列 = 打开所在目录；双击其他列 = 打开文件
