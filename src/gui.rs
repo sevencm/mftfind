@@ -827,6 +827,8 @@ impl eframe::App for App {
 
         // ---------- 结果表 ----------
         egui::CentralPanel::default().show(ui, |ui| {
+            disable_text_selection(ui);
+
             let row_h = ROW_HEIGHT;
             let avail = ui.available_width();
             let w_size = 90.0;
@@ -868,23 +870,26 @@ impl eframe::App for App {
                         let row = row_meta(&mut self.meta_cache, ix, h.vol, h.idx, &full);
                         let size_text = row.size;
 
+                        // 行矩形必须从 cursor 取，详见 row_rect 的注释
+                        let rect = row_rect(ui, row_h);
+                        // 整行一个交互区：四个单元格只占左边一段，右边留白也必须
+                        // 能点中、能右键，否则行尾是死区。显式 id 还让右键菜单的
+                        // 弹出位置在滚动时保持不变。
+                        let resp = ui.interact(
+                            rect,
+                            egui::Id::new(("mftfind-row", i)),
+                            egui::Sense::click(),
+                        );
                         if self.selected == Some(i) {
-                            let rect = ui.max_rect();
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.left(), rect.top()),
-                                    egui::vec2(rect.width(), row_h),
-                                ),
-                                2.0,
-                                ui.visuals().selection.bg_fill,
-                            );
+                            ui.painter()
+                                .rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
                         }
 
                         // 记下「路径」列的矩形：双击要用它区分「打开文件」和
                         // 「打开所在目录」。整行是一个响应，分不出点在哪一列。
                         let mut path_rect: Option<egui::Rect> = None;
-                        let resp = ui
-                            .horizontal(|ui| {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.horizontal(|ui| {
                                 let name_text = if is_dir {
                                     egui::RichText::new(format!("📁 {}", name)).color(egui::Color32::from_rgb(90, 150, 230))
                                 } else {
@@ -904,15 +909,23 @@ impl eframe::App for App {
                                 path_rect = Some(path_resp.rect);
                                 ui.add_sized([w_size, row_h], egui::Label::new(size_text));
                                 ui.add_sized([w_time, row_h], egui::Label::new(row.time));
-                            })
-                            .response
-                            .interact(egui::Sense::click());
+                            });
+                        });
 
                         if resp.clicked() {
                             self.selected = Some(i);
-                            // 把焦点从搜索框收回来，否则之后按 Ctrl+C 会被输入框
-                            // 当作文本复制吃掉
-                            resp.surrender_focus();
+                        }
+                        // 右键也算「指到了这一行」：先选中，菜单里的操作和工具栏按钮
+                        // 才指向同一个文件，不用再点一次左键
+                        if resp.secondary_clicked() {
+                            self.selected = Some(i);
+                        }
+                        if resp.clicked() || resp.secondary_clicked() {
+                            // 焦点必须从搜索框真正收回来，否则 Ctrl+C 会被输入框
+                            // 当作文本复制吃掉。注意 Response::surrender_focus() 只在
+                            // 「焦点本来就在自己身上」时才生效，对搜索框无效，
+                            // 所以直接清掉当前焦点。
+                            ui.ctx().memory_mut(|m| m.stop_text_input());
                         }
                         if resp.double_clicked() {
                             // 双击路径列 = 打开所在目录；双击其他列 = 打开文件
@@ -969,6 +982,24 @@ impl eframe::App for App {
             None => {}
         }
     }
+}
+
+/// 结果行的矩形。
+///
+/// **不能用 `ui.max_rect()`**：`ScrollArea::show_rows` 传进闭包的那个 ui 覆盖的是
+/// 整个可见区，它的 `max_rect()` 对每一行都返回同一个值，高亮会永远画在可见区
+/// 顶边——方向键就像没反应。行矩形只能由 cursor 推出来。
+fn row_rect(ui: &egui::Ui, row_h: f32) -> egui::Rect {
+    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), row_h))
+}
+
+/// 关掉结果区的「标签文本可选中」。
+///
+/// egui 0.36 起 `Label` 默认可选中文本，而可选标签会 sensing click_and_drag。
+/// 一行由四个标签铺满，整行就被标签盖住，行自己的单击、双击、右键全收不到。
+/// 结果表没有复制文本的需求，整片关掉。
+fn disable_text_selection(ui: &mut egui::Ui) {
+    ui.style_mut().interaction.selectable_labels = false;
 }
 
 /// 方向键移动后的落点，`cur` 为 None 表示当前没有选中行。
@@ -1131,5 +1162,163 @@ mod tests {
         // 空结果集：不选中任何东西
         assert_eq!(next_selection(None, 0, false), None);
         assert_eq!(next_selection(Some(0), 0, true), None);
+    }
+
+    /// 造一帧输入事件。行命中测试要按屏幕坐标做，所以必须给出 screen_rect。
+    fn frame_input(t: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(t),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn pointer_button(p: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// 每一行必须拿到自己的矩形。
+    ///
+    /// `show_rows` 传进闭包的 ui 覆盖整个可见区，`max_rect()` 因此对每一行都相同——
+    /// 早先高亮就是用它画的，结果选中条永远停在可见区顶边，方向键看起来完全没反应。
+    #[test]
+    fn each_row_gets_its_own_rect() {
+        let ctx = egui::Context::default();
+        let row_h = ROW_HEIGHT;
+        let mut tops = Vec::new();
+        let mut band_tops = Vec::new();
+
+        let mut out = ctx.run_ui(frame_input(0.0, vec![]), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                disable_text_selection(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show_rows(ui, row_h, 20, |ui, range| {
+                        for _ in range {
+                            tops.push(row_rect(ui, row_h).top());
+                            band_tops.push(ui.max_rect().top());
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("row");
+                                },
+                            );
+                        }
+                    });
+            });
+        });
+        out.textures_delta.clear();
+
+        assert!(tops.len() >= 3, "可见区应当画出多行，实际 {}", tops.len());
+        for pair in tops.windows(2) {
+            assert!(
+                pair[1] > pair[0] + 1.0,
+                "行矩形没有逐行下移：{:?} —— 检查 row_rect 是否又用回了 max_rect()",
+                tops
+            );
+        }
+        // 这正是不能用 max_rect() 的理由：它对每一行返回同一个顶边
+        assert!(
+            band_tops.windows(2).all(|w| (w[0] - w[1]).abs() < f32::EPSILON),
+            "show_rows 的 max_rect() 行为变了：{:?}",
+            band_tops
+        );
+    }
+
+    /// 右键点在某一行上，这一行必须收到事件。
+    ///
+    /// 锁的是「标签可选中」这个坑：egui 0.36 的 Label 默认可选中文本，会 sensing
+    /// click_and_drag，一行被几个标签铺满时点击全被标签吃掉，右键菜单永远不弹、
+    /// 单击也选不中。去掉 disable_text_selection 这段这里就会挂。
+    #[test]
+    fn row_receives_secondary_click() {
+        let ctx = egui::Context::default();
+        let row_h = ROW_HEIGHT;
+        let mut rects: Vec<egui::Rect> = Vec::new();
+        let mut hovered = false;
+        let mut secondary = false;
+        let mut menu = false;
+
+        for n in 0..4 {
+            let events = match n {
+                0 => Vec::new(),
+                1 => {
+                    // 特意点在单元格文字上：标签若还能吞点击，这里就收不到事件
+                    let c = rects[2].left_center() + egui::vec2(20.0, 0.0);
+                    vec![egui::Event::PointerMoved(c), pointer_button(c, true)]
+                }
+                2 => vec![pointer_button(
+                    rects[2].left_center() + egui::vec2(20.0, 0.0),
+                    false,
+                )],
+                // 点击是在松开之后的那一帧才由 egui 报出来的，所以要多跑一帧
+                _ => Vec::new(),
+            };
+
+            let mut out = ctx.run_ui(frame_input(n as f64 * 0.1, events), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    disable_text_selection(ui);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show_rows(ui, row_h, 20, |ui, range| {
+                            for i in range {
+                                let rect = row_rect(ui, row_h);
+                                // 与界面同构：整行一个交互区，内容叠在它上面
+                                let resp = ui.interact(
+                                    rect,
+                                    egui::Id::new(("test-row", i)),
+                                    egui::Sense::click(),
+                                );
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized([120.0, row_h], egui::Label::new("name"));
+                                        ui.add_sized([120.0, row_h], egui::Label::new("path"));
+                                    });
+                                });
+                                if n == 0 {
+                                    rects.push(rect);
+                                }
+                                if i == 2 {
+                                    // 点击只在松开那一帧为真，按帧覆盖会把它冲掉
+                                    hovered |= resp.hovered();
+                                    secondary |= resp.secondary_clicked();
+                                }
+                                resp.context_menu(|ui| {
+                                    menu = true;
+                                    ui.label("menu");
+                                });
+                            }
+                        });
+                });
+            });
+            out.textures_delta.clear();
+        }
+
+        // 顺带确认这一套写法下各行仍然逐行下移（scope 没有把行压在同一处）
+        assert!(rects.len() >= 3, "可见行数不足：{}", rects.len());
+        for pair in rects.windows(2) {
+            assert!(
+                pair[1].top() > pair[0].top() + 1.0,
+                "行没有逐行下移：{:?}",
+                rects.iter().map(|r| r.top()).collect::<Vec<_>>()
+            );
+        }
+
+        assert!(secondary, "右键没有落到行上——标签是不是又变成可选中了？");
+        assert!(menu, "右键菜单没有建立");
+        assert!(
+            hovered || secondary,
+            "行既没有 hover 也没有点击，说明命中被标签抢走了"
+        );
     }
 }
