@@ -231,12 +231,15 @@ struct DriveItem {
 pub struct App {
     indexes: Arc<Vec<Index>>,
     query: String,
-    /// 上次发起搜索时的 (查询词, 排序, 路径模式)。
-    /// 三者任一变化都要重搜——早先只盯查询词，导致改排序或勾「路径」
+    /// 上次发起搜索时的 (查询词, 排序列, 方向, 路径模式)。
+    /// 四者任一变化都要重搜——早先只盯查询词，导致改排序或勾「路径」
     /// 之后结果不变，得等下次输入才生效。
-    last_key: (String, SortBy, bool),
+    last_key: (String, SortBy, bool, bool),
     path_mode: bool,
     sort: SortBy,
+    /// 排序方向是否反转。比较器只实现各列的默认方向，反向由
+    /// spawn_search 在排完后整体 reverse 得到，不维护第二套比较器。
+    sort_desc: bool,
     hits: Arc<Mutex<Vec<Hit>>>,
     meta: Arc<Mutex<Meta>>,
     generation: u64,
@@ -279,9 +282,10 @@ impl App {
         let mut app = App {
             indexes,
             query: String::new(),
-            last_key: (String::new(), SortBy::Name, false),
+            last_key: (String::new(), SortBy::Name, false, false),
             path_mode: false,
             sort: SortBy::Name,
+            sort_desc: false,
             hits: Arc::new(Mutex::new(Vec::new())),
             meta: Arc::new(Mutex::new(Meta {
                 ms: 0.0,
@@ -400,6 +404,7 @@ impl App {
         let meta = self.meta.clone();
         let path_mode = self.path_mode;
         let sort = self.sort;
+        let sort_desc = self.sort_desc;
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
@@ -424,6 +429,11 @@ impl App {
                 }
                 let total = all.len();
                 sort_hits_multi(&indexes, &mut all, sort);
+                // 反向 = 已排序的序列整体倒一下（比较器取反），不必维护第二套比较器。
+                // 有序序列反转后依然有序；并列项的相对先后会翻，对展示无影响。
+                if sort_desc {
+                    all.reverse();
+                }
                 let mut m = meta.lock().unwrap();
                 m.ms = t0.elapsed().as_secs_f64() * 1000.0;
                 m.total = total;
@@ -708,20 +718,10 @@ impl eframe::App for App {
                 if resp.clicked() {
                     self.list_active = false;
                 }
-                ui.checkbox(&mut self.path_mode, s.path_mode);
-                egui::ComboBox::from_id_salt("sort")
-                    .selected_text(match self.sort {
-                        SortBy::Name => s.sort_name,
-                        SortBy::Modified => s.sort_modified,
-                        SortBy::Size => s.sort_size,
-                        SortBy::Kind => s.sort_kind,
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sort, SortBy::Name, s.sort_name);
-                        ui.selectable_value(&mut self.sort, SortBy::Modified, s.sort_modified);
-                        ui.selectable_value(&mut self.sort, SortBy::Size, s.sort_size);
-                        ui.selectable_value(&mut self.sort, SortBy::Kind, s.sort_kind);
-                    });
+                // 排序入口在结果表列头（点列头排序），工具栏不再放下拉框——
+                // 「名称」和表头第一列撞名，看起来像显示开关而不是排序。
+                ui.checkbox(&mut self.path_mode, s.path_mode)
+                    .on_hover_text(s.path_mode_tip);
             });
             ui.horizontal(|ui| {
                 if ui.button(s.choose_scope).clicked() {
@@ -833,8 +833,8 @@ impl eframe::App for App {
         }
 
         // ---------- 查询变化触发搜索 ----------
-        // 查询词 / 排序 / 路径模式任一变化都要重搜
-        let key = (self.query.clone(), self.sort, self.path_mode);
+        // 查询词 / 排序列 / 方向 / 路径模式任一变化都要重搜
+        let key = (self.query.clone(), self.sort, self.sort_desc, self.path_mode);
         if key != self.last_key {
             self.last_key = key;
             // 结果集马上要换，旧的行号不再代表同一个文件。
@@ -854,11 +854,27 @@ impl eframe::App for App {
             let w_name = (avail * 0.32).clamp(140.0, 420.0);
             let w_path = (avail - w_name - w_size - w_time - 24.0).max(120.0);
 
+            // 列头即排序入口：当前列带 ▲/▼ 方向指示，悬停有点击感
             ui.horizontal(|ui| {
-                ui.add_sized([w_name, row_h], egui::Label::new(egui::RichText::new(s.col_name).strong()));
-                ui.add_sized([w_path, row_h], egui::Label::new(egui::RichText::new(s.col_path).strong()));
-                ui.add_sized([w_size, row_h], egui::Label::new(egui::RichText::new(s.col_size).strong()));
-                ui.add_sized([w_time, row_h], egui::Label::new(egui::RichText::new(s.col_modified).strong()));
+                for (col, w, label) in [
+                    (SortBy::Name, w_name, s.col_name),
+                    (SortBy::Path, w_path, s.col_path),
+                    (SortBy::Size, w_size, s.col_size),
+                    (SortBy::Modified, w_time, s.col_modified),
+                ] {
+                    let resp = sort_header(
+                        ui,
+                        w,
+                        row_h,
+                        label,
+                        self.sort == col,
+                        self.sort_desc,
+                    );
+                    if resp.clicked() {
+                        (self.sort, self.sort_desc) =
+                            header_click(self.sort, self.sort_desc, col);
+                    }
+                }
             });
             ui.separator();
 
@@ -1015,6 +1031,40 @@ fn disable_text_selection(ui: &mut egui::Ui) {
     ui.style_mut().interaction.selectable_labels = false;
 }
 
+/// 点列头之后的排序状态：同列再点一次反转方向，换列用该列的默认方向。
+///
+/// 默认方向按「这个列通常想怎么看」定：名称/路径字典序升序，
+/// 时间/大小大的在前（最新 / 最大优先）。抽成纯函数是为了能测。
+fn header_click(cur: SortBy, cur_desc: bool, clicked: SortBy) -> (SortBy, bool) {
+    if clicked == cur {
+        (cur, !cur_desc)
+    } else {
+        let default_desc = matches!(clicked, SortBy::Modified | SortBy::Size);
+        (clicked, default_desc)
+    }
+}
+
+/// 列头单元格：透明底按钮（悬停有点击感），当前排序列追加 ▲/▼ 方向箭头。
+fn sort_header(
+    ui: &mut egui::Ui,
+    w: f32,
+    row_h: f32,
+    label: &str,
+    active: bool,
+    desc: bool,
+) -> egui::Response {
+    let text = if active {
+        let arrow = if desc { "▼" } else { "▲" };
+        egui::RichText::new(format!("{label} {arrow}")).strong()
+    } else {
+        egui::RichText::new(label).strong().weak()
+    };
+    ui.add_sized(
+        [w, row_h],
+        egui::Button::new(text).fill(egui::Color32::TRANSPARENT),
+    )
+}
+
 /// 方向键移动后的落点，`cur` 为 None 表示当前没有选中行。
 ///
 /// 抽成纯函数是为了能测边界：只有一行、已在首行/末行、还没有选中。
@@ -1116,6 +1166,15 @@ mod tests {
         assert!(renders("中"), "CJK 字体回退失效，中文会显示成豆腐块");
     }
 
+    /// 列头的方向箭头必须真能渲染出来（道理同上：默认字体栈缺字形就变豆腐块）。
+    #[test]
+    fn sort_direction_arrows_are_renderable() {
+        assert!(
+            renders("▲▼"),
+            "字体栈里没有 ▲/▼ 的字形，列头方向指示会显示成豆腐块——检查 install_fonts 里的符号字体回退"
+        );
+    }
+
     /// 时间戳的「未知」约定：<= 0 一律不显示。
     /// MFT 枚举路径拿不到时间戳，落盘时写 0；旧索引里还有 -11644473600
     /// （FILETIME 0 减偏移的产物），两种都得当未知处理，否则会显示成 1601 年。
@@ -1175,6 +1234,25 @@ mod tests {
         // 空结果集：不选中任何东西
         assert_eq!(next_selection(None, 0, false), None);
         assert_eq!(next_selection(Some(0), 0, true), None);
+    }
+
+    /// 第一次点某列，就该落在用户最常用的方向上：
+    /// 名称/路径升序（字典序），时间/大小降序（最新/最大在前）。
+    #[test]
+    fn header_click_picks_sensible_default_directions() {
+        assert_eq!(header_click(SortBy::Name, false, SortBy::Modified), (SortBy::Modified, true));
+        assert_eq!(header_click(SortBy::Modified, true, SortBy::Size), (SortBy::Size, true));
+        assert_eq!(header_click(SortBy::Size, true, SortBy::Path), (SortBy::Path, false));
+        assert_eq!(header_click(SortBy::Path, false, SortBy::Name), (SortBy::Name, false));
+    }
+
+    /// 同列再点一次 = 反转方向，来回点应稳定往返。
+    #[test]
+    fn header_click_toggles_direction_on_same_column() {
+        assert_eq!(header_click(SortBy::Name, false, SortBy::Name), (SortBy::Name, true));
+        assert_eq!(header_click(SortBy::Name, true, SortBy::Name), (SortBy::Name, false));
+        assert_eq!(header_click(SortBy::Modified, true, SortBy::Modified), (SortBy::Modified, false));
+        assert_eq!(header_click(SortBy::Modified, false, SortBy::Modified), (SortBy::Modified, true));
     }
 
     /// 造一帧输入事件。行命中测试要按屏幕坐标做，所以必须给出 screen_rect。

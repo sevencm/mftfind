@@ -120,7 +120,8 @@ builds keep the console subsystem, so `cargo run -- bench` behaves normally.
 ### GUI
 
 - Incremental search — results narrow as you type
-- Sort by name / modified time / size / kind
+- Click a column header to sort by it; click again to flip the direction
+  (name / path / size / modified time)
 - Size and modified-time columns; on MFT-built volumes they are filled in from
   the filesystem for the visible rows as you scroll (see above)
 - Open a result, reveal it in Explorer, or copy its full path — four ways in:

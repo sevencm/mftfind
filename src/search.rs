@@ -25,17 +25,20 @@ pub fn tokenize(query: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// 结果排序方式
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// 结果排序方式。变体与结果表的四列一一对应（点列头排序）。
+///
+/// 比较器只实现每个变体的「默认方向」：名称/路径升序，时间/大小降序。
+/// 反向不用写第二套比较器，调用方把排好的序列整体反转即可。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortBy {
-    /// 名称（不区分大小写）
+    /// 名称，升序（不区分大小写）
     Name,
-    /// 修改时间（新 → 旧）
+    /// 完整路径，升序（不区分大小写）
+    Path,
+    /// 修改时间，默认降序（新 → 旧）
     Modified,
-    /// 大小（大 → 小，未知尺寸排最后）
+    /// 大小，默认降序（大 → 小，未知尺寸排最后）
     Size,
-    /// 目录优先，再按名称
-    Kind,
 }
 
 /// 带卷号的命中项
@@ -45,8 +48,12 @@ pub struct Hit {
     pub idx: u32,
 }
 
-/// 跨卷排序：比较时按卷号取对应索引
+/// 跨卷排序：比较时按卷号取对应索引。
 pub fn sort_hits_multi(indexes: &[Index], hits: &mut [Hit], by: SortBy) {
+    if by == SortBy::Path {
+        sort_by_path(indexes, hits);
+        return;
+    }
     hits.sort_unstable_by(|a, b| {
         let ia = &indexes[a.vol];
         let ib = &indexes[b.vol];
@@ -58,12 +65,29 @@ pub fn sort_hits_multi(indexes: &[Index], hits: &mut [Hit], by: SortBy) {
                 let sb = ib.size(b.idx).unwrap_or(u64::MAX);
                 sb.cmp(&sa)
             }
-            SortBy::Kind => ib
-                .is_dir(b.idx)
-                .cmp(&ia.is_dir(a.idx))
-                .then_with(|| ia.lower_name(a.idx).cmp(ib.lower_name(b.idx))),
+            SortBy::Path => unreachable!("path sort is handled before the comparator"),
         }
     });
+}
+
+/// 按完整路径排序（跨卷版）。
+///
+/// 名字能直接从索引取现成的小写串来比，路径不行——完整路径要沿父链现场拼。
+/// 放进比较函数里就是 O(n log n) 次重复拼路径，所以先把 key 一次性算出来再排。
+/// 结果集上限是每卷 2 万条，全部拼一遍在几十毫秒量级，只在按路径排序时发生。
+fn sort_by_path(indexes: &[Index], hits: &mut [Hit]) {
+    let mut pairs: Vec<(Box<str>, Hit)> = hits
+        .iter()
+        .map(|h| {
+            let mut p = indexes[h.vol].full_path(h.idx);
+            p.make_ascii_lowercase();
+            (p.into_boxed_str(), *h)
+        })
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (slot, (_, h)) in hits.iter_mut().zip(pairs) {
+        *slot = h;
+    }
 }
 
 /// 在单个卷索引上搜索
@@ -224,6 +248,22 @@ pub fn search_paths(indexes: &[Index], vol: usize, tokens: &[Vec<u8>], limit: us
 
 /// 按要求排序命中的记录下标
 pub fn sort_hits(index: &Index, hits: &mut [u32], by: SortBy) {
+    if by == SortBy::Path {
+        // 与 sort_by_path 同理：先拼 key 再排，别把路径拼接塞进比较器
+        let mut pairs: Vec<(Box<str>, u32)> = hits
+            .iter()
+            .map(|&i| {
+                let mut p = index.full_path(i);
+                p.make_ascii_lowercase();
+                (p.into_boxed_str(), i)
+            })
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (slot, (_, i)) in hits.iter_mut().zip(pairs) {
+            *slot = i;
+        }
+        return;
+    }
     match by {
         SortBy::Name => hits.sort_unstable_by(|&a, &b| index.lower_name(a).cmp(index.lower_name(b))),
         SortBy::Modified => hits.sort_unstable_by(|&a, &b| index.mtime(b).cmp(&index.mtime(a))),
@@ -232,12 +272,7 @@ pub fn sort_hits(index: &Index, hits: &mut [u32], by: SortBy) {
             let sb = index.size(b).unwrap_or(u64::MAX);
             sb.cmp(&sa)
         }),
-        SortBy::Kind => hits.sort_unstable_by(|&a, &b| {
-            index
-                .is_dir(b)
-                .cmp(&index.is_dir(a))
-                .then_with(|| index.lower_name(a).cmp(index.lower_name(b)))
-        }),
+        SortBy::Path => unreachable!("path sort is handled above"),
     }
 }
 
