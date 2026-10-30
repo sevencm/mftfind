@@ -88,6 +88,11 @@ pub struct Strings {
     pub search_ms_tmpl: &'static str,
     pub type_to_search: &'static str,
 
+    // ---------- 结果区为空时的提示（三种原因，不能混成一句） ----------
+    pub empty_no_index: &'static str,
+    pub empty_loaded_tmpl: &'static str,
+    pub empty_no_match: &'static str,
+
     // ---------- 索引范围窗口 ----------
     pub scope_title: &'static str,
     pub scope_hint: &'static str,
@@ -161,6 +166,11 @@ impl Strings {
 
     pub fn hit_count(&self, n: usize) -> String {
         fill(self.hit_count_tmpl, &[&n])
+    }
+
+    /// 空结果区「索引已就绪」的提示：带上卷数与记录数，让「已加载」可见。
+    pub fn empty_loaded(&self, volumes: usize, records: usize) -> String {
+        fill(self.empty_loaded_tmpl, &[&volumes, &records])
     }
 
     pub fn search_ms(&self, ms: f64) -> String {
@@ -248,6 +258,10 @@ const ZH: Strings = Strings {
     search_ms_tmpl: "搜索 {} ms",
     type_to_search: "输入关键词开始搜索",
 
+    empty_no_index: "还没有可用的索引：点上方「选择索引范围 / 重建」建立索引",
+    empty_loaded_tmpl: "已加载 {} 个卷 / {} 条索引，输入关键词开始搜索",
+    empty_no_match: "没有匹配的结果，换个关键词试试",
+
     scope_title: "选择索引范围",
     scope_hint: "勾选需要索引的磁盘（管理员权限下走 MFT，约 1~3 秒/百万文件）：",
     already_indexed: "（已有索引）",
@@ -300,6 +314,10 @@ const EN: Strings = Strings {
     hit_count_tmpl: "{} hits",
     search_ms_tmpl: "search {} ms",
     type_to_search: "Type a keyword to search",
+
+    empty_no_index: "No usable index yet: build one with Choose volumes / rebuild above",
+    empty_loaded_tmpl: "{} volumes / {} records loaded, type a keyword to search",
+    empty_no_match: "No matches, try a different keyword",
 
     scope_title: "Choose index scope",
     scope_hint: "Select the volumes to index (MFT is used when elevated, ~1-3 s per million files):",
@@ -383,7 +401,7 @@ mod tests {
     /// 所有带参数的模板配对。
     /// 中英两版的占位符个数必须一致——少一个 `{}` 不会 panic，
     /// 只会让界面静默少显示一段信息（例如丢掉「扫描 1.5s」），很难靠肉眼发现。
-    fn template_pairs() -> [(&'static str, &'static str); 11] {
+    fn template_pairs() -> [(&'static str, &'static str); 12] {
         [
             (ZH.indexing_start_tmpl, EN.indexing_start_tmpl),
             (ZH.indexing_progress_tmpl, EN.indexing_progress_tmpl),
@@ -393,6 +411,7 @@ mod tests {
             (ZH.volumes_and_records_tmpl, EN.volumes_and_records_tmpl),
             (ZH.hit_count_tmpl, EN.hit_count_tmpl),
             (ZH.search_ms_tmpl, EN.search_ms_tmpl),
+            (ZH.empty_loaded_tmpl, EN.empty_loaded_tmpl),
             (ZH.shortcut_tip_tmpl, EN.shortcut_tip_tmpl),
             (ZH.open_failed_tmpl, EN.open_failed_tmpl),
             (ZH.reveal_failed_tmpl, EN.reveal_failed_tmpl),
@@ -439,6 +458,7 @@ mod tests {
                 s.indexing_failed('C', "access denied"),
                 s.mft_fallback("access denied"),
                 s.volumes_and_records(7, 9_214_651),
+                s.empty_loaded(7, 9_214_651),
                 s.hit_count(42),
                 s.search_ms(150.0),
                 s.open_failed("err"),

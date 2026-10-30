@@ -881,6 +881,19 @@ impl eframe::App for App {
             let hit_list = self.hits.lock().unwrap().clone();
             let n = hit_list.len();
 
+            // 空结果区不能一片空白：开屏时索引其实已经加载好，只是还没输入关键词，
+            // 什么都不画就会被当成「没加载索引」。三种空态的原因不同，分开说。
+            if n == 0 {
+                empty_hint(
+                    ui,
+                    s,
+                    self.indexes.len(),
+                    self.total_records,
+                    self.query.trim().is_empty(),
+                );
+                return;
+            }
+
             let mut sa = egui::ScrollArea::vertical().auto_shrink([false; 2]);
             if self.scroll_to_selected {
                 self.scroll_to_selected = false;
@@ -1013,6 +1026,42 @@ impl eframe::App for App {
     }
 }
 
+/// 结果区为空时的提示。
+///
+/// 三种空态的原因完全不同：索引都没有、索引加载好了但还没输入关键词、
+/// 输了但没命中。合并成一句「没有结果」会误导——尤其第二种，
+/// 那恰恰说明索引加载成功，用一句「没有结果」就把这条信息埋掉了。
+///
+/// `volumes` 取已加载的卷数、`records` 取启动时统计的记录总数，
+/// 都是 `App::new` 里直接从索引文件读出来的，不额外扫盘。
+fn empty_hint(
+    ui: &mut egui::Ui,
+    s: &i18n::Strings,
+    volumes: usize,
+    records: usize,
+    query_empty: bool,
+) {
+    let msg = empty_message(s, volumes, records, query_empty);
+    // 垂直方向压到偏上三分之一处：居中会随窗口高度飘，视线还得重新找
+    ui.add_space(ui.available_height() * 0.3);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(msg).weak());
+    });
+}
+
+/// 空结果区该说哪句话。
+///
+/// 单独拎出来是为了能直接断言分支，不必先搭一个 egui 上下文。
+fn empty_message(s: &i18n::Strings, volumes: usize, records: usize, query_empty: bool) -> String {
+    if volumes == 0 {
+        s.empty_no_index.to_string()
+    } else if query_empty {
+        s.empty_loaded(volumes, records)
+    } else {
+        s.empty_no_match.to_string()
+    }
+}
+
 /// 结果行的矩形。
 ///
 /// **不能用 `ui.max_rect()`**：`ScrollArea::show_rows` 传进闭包的那个 ui 覆盖的是
@@ -1132,6 +1181,18 @@ pub fn run() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 开屏（有索引、没关键词）必须说「已加载」，不能退化成「没有结果」——
+    /// 那句话是用户唯一能看出索引真的加载成功的地方。
+    #[test]
+    fn empty_message_picks_the_right_reason() {
+        let s = Lang::Zh.strings();
+        assert_eq!(empty_message(s, 0, 0, true), s.empty_no_index);
+        assert_eq!(empty_message(s, 7, 9_214_651, true), s.empty_loaded(7, 9_214_651));
+        assert_eq!(empty_message(s, 7, 9_214_651, false), s.empty_no_match);
+        // 有索引就必须带上真实卷数与记录数，别只说一句「就绪」
+        assert!(empty_message(s, 7, 9_214_651, true).contains("7"));
+    }
 
     /// 用界面同一套字体栈渲染一帧，报告某个字符有没有字形。
     fn renders(text: &str) -> bool {
